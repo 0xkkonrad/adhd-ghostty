@@ -57,7 +57,7 @@ DECAY_DAYS = int(ENV("SESSIONS_DECAY_DAYS", "3"))          # unmarked → archiv
 OPEN_GRACE_DAYS = float(ENV("SESSIONS_OPEN_GRACE_DAYS", "1"))   # open + unmarked + idle this long → stale
 SWEEP_COMMS = {c.strip() for c in (ENV("SESSIONS_SWEEP_COMMS") or "claude,codex").split(",") if c.strip()}
 SNAPSHOT_MAX_AGE = 60
-BACKLOG_CAP = 20
+BACKLOG_CAP = 40
 MAX_PARK_DAYS = 3650
 BUS, OBJ = "com.mitchellh.ghostty", "/com/mitchellh/ghostty"
 ICON = {"idle": "⚪", "busy": "🚧", "done": "🟢", "ask": "🔴"}
@@ -668,12 +668,13 @@ def build_rows(model, show_done=False, expand=False, filt=""):
         rows.append({"kind": "pinned", "slot": status_slot(r) if r["open"] else "  ", "title": r["title"],
                      "right": right_text(r, now, False), "sid": r["sid"], "rec": r, "surf": None, "sweep": False})
     if pinned:
+        rows.insert(0, {"kind": "rule", "title": "📌 pinned", "sid": None})
         rows.append({"kind": "blank", "sid": None})
     for w in model["windows"]:
         tabs = w["tabs"]
         if not tabs:                      # window with only shell/tmux panes: nothing to show
             continue
-        rows.append({"kind": "window", "n": w["n"], "sid": None})
+        rows.append({"kind": "rule", "title": f"window {w['n']}", "sid": None})
         for i, t in enumerate(tabs):
             last_tab = i == len(tabs) - 1
             surfs = t["surfaces"]
@@ -702,7 +703,7 @@ def build_rows(model, show_done=False, expand=False, filt=""):
                              "win_title": w["title"]})
                 seen.append(s["sid"])
     rows.append({"kind": "blank", "sid": None})
-    rows.append({"kind": "rule", "sid": None})
+    rows.append({"kind": "rule", "title": "history", "sid": None})
     back = [r for r in S.values() if not r["open"] and (r["state"] in ("parked", "unsorted") or (show_done and r["state"] == "done"))]
     if f:
         back = [r for r in back if f in r["title"].lower()]
@@ -731,16 +732,14 @@ def build_rows(model, show_done=False, expand=False, filt=""):
 def render_row(row, w, cursor=False):
     g = "▶" if cursor else " "
     k = row["kind"]
-    if k == "window":
-        head = f"══ {row['n']} "
-        return head + "═" * max(0, w - width(head))
     if k == "blank":
         return ""
     if k == "rule":
-        return "≡" * w
+        head = f"══ {row['title']} "
+        return head + "═" * max(0, w - width(head))
     if k == "more":
         tail = f"+{row['n']}" if row["n"] > 0 else ""
-        return "≡" * max(0, w - width(tail)) + tail
+        return "═" * max(0, w - width(tail)) + tail
     if k == "pinned":
         left = f"📌{'▶' if cursor else ' '}{row['slot']} "
     elif k in ("tab", "split"):
@@ -759,7 +758,7 @@ def sweep_count(rows):
 def render(model, rows, w=56, cursor=None, footer_msg=None, detail=None, height=None):
     w = max(40, w)
     lines = [render_row(r, w, cursor is not None and i == cursor) for i, r in enumerate(rows)]
-    default_footer = f" s 🧹 {sweep_count(rows)}" if model.get("fresh", True) else " snapshot stale"
+    default_footer = f" c 🧹 {sweep_count(rows)}" if model.get("fresh", True) else " snapshot stale"
     footer = pad_line(footer_msg if footer_msg is not None else default_footer, "?", w)
     body = lines
     if height:
@@ -982,15 +981,15 @@ def term_size():
 HELP = [
     "═══ keys ═══",
     " j/k ↑↓  move        ↵  focus hint / resume",
-    " r  resume (closed)   p  park: days or s, note",
-    " x  done     a  activate     s  sweep 🧹 panes",
-    " i  pin / unpin (📌 section at the top, never decays)",
+    " r  resume (closed)   s  snooze (park): days or s, note",
+    " p  pin / unpin (📌 section at the top, never decays)",
+    " x  done     a  activate     c  close 🧹 panes (sweep)",
     " /  filter   Esc clear   space  detail pane",
     " D  show done   m  whole backlog   q  quit",
     "",
     " ══ N  window   ├N tab (alt+N)   ├─ split   └⑂ fork",
     " ⚪🚧🟢🔴 live  ▫ codex   right: wait age | Nd wake | 📌",
-    " ?Nd archive countdown   🧹 = s closes this pane",
+    " ?Nd archive countdown   🧹 = c closes this pane",
 ]
 
 
@@ -1080,7 +1079,7 @@ def tui(width_opt=None):
             elif m == "filter":
                 foot = f" /{state['buf']}"
             elif m == "days":
-                foot = f" park: days [1] or s {state['buf']}"
+                foot = f" snooze: days [1] or s {state['buf']}"
             elif m == "note":
                 foot = f" note: {state['buf']}"
             elif m == "confirm":
@@ -1159,7 +1158,7 @@ def tui(width_opt=None):
                 state["help"] = True
             elif ch == " ":
                 state["detail"] = not state["detail"]
-            elif ch == "i" and rec:
+            elif ch == "p" and rec:
                 if rec["state"] == "pinned":
                     ledger_append(rec["sid"], "active", rec["kind"], src="tui")
                     say(f"unpinned: {rec['title']}")
@@ -1187,7 +1186,7 @@ def tui(width_opt=None):
                     ok, msg = do_resume(rec)
                     say(("✓ " if ok else "✗ ") + msg)
                     rebuild()
-            elif ch == "p" and rec:
+            elif ch == "s" and rec:
                 state["mode"], state["buf"], state["park_days"] = "days", "", None
             elif ch == "x" and rec:
                 ledger_append(rec["sid"], "done", rec["kind"], src="tui")
@@ -1197,14 +1196,14 @@ def tui(width_opt=None):
                 ledger_append(rec["sid"], "active", rec["kind"], src="tui")
                 say(f"active: {rec['title']}")
                 rebuild()
-            elif ch == "s":
+            elif ch == "c":
                 n = sweep_count(rows)
                 if not model.get("fresh", False):
                     say("snapshot stale: no sweep")
                 elif n == 0:
                     say("nothing to sweep")
                 elif n > 3:
-                    state["mode"], state["buf"] = "confirm", f"sweep {n} panes?"
+                    state["mode"], state["buf"] = "confirm", f"close {n} panes?"
                 else:
                     res, err = sweep(model, rows)
                     say(err or f"swept {sum(1 for _, s in res if s and not s[0].startswith('skipped'))} of {len(res)}")

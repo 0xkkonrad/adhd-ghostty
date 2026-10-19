@@ -58,7 +58,7 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
 - Reactivation: `sessions touch <sid>` sets active (src=hook). Add ONE call to it in
   `~/.claude/hooks/tab-status.py` on `UserPromptSubmit` (detached, never blocking the hook; must
   not break the hook if `sessions` is missing).
-- **pinned** (`i`, `/pin` toggle, `sessions pin|unpin SID`): keep for later, no date, never decays; a prompt
+- **pinned** (`p`, `/pin` toggle, `sessions pin|unpin SID`): keep for later, no date, never decays; a prompt
   in a pinned session keeps it pinned (the hook writes a `pinned` line); unpin → active if open, else
   unsorted with the countdown restarting now.
 - Skills: `~/.claude/skills/park/SKILL.md` (`/park [days] [note]`, default 1 day) and
@@ -81,12 +81,13 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
                                   #   (or `codex resume <thread>`), via D-Bus new-tab + pending file
     sessions install              # add the hook line + skills + program kind; idempotent; prints what it did
 
-## TUI rendering — the agreed mockup (56 cols; width = split width, min 40; pinned added 19 Oct)
+## TUI rendering — the agreed mockup (56 cols; width = split width, min 40; pinned + titled rules 19 Oct)
 ```
+══ 📌 pinned ═══════════════════════════════════════════
 📌 🟢 Lisbon Sailing Research                         2h
 📌    Referral v3 success metric                      5d
 
-══ 1 ═══════════════════════════════════════════════════
+══ window 1 ════════════════════════════════════════════
  ├1 ⚪ LP Refresh Competitor                          🧹
  ├2 🚧 Design system landing page
  ├3 ⚪ Shotgun split tree review                  🧹 ?2d
@@ -97,56 +98,55 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
  ├5 🟢 Lisbon Sailing Research                     🧹 📌
  ├6 🟢 Stale Docs Cleanup                             🧹
 ▶└7 🚧 Multi-Session Dashboard
-══ 2 ═══════════════════════════════════════════════════
+══ window 2 ════════════════════════════════════════════
  └1 🔴 Welecja Drive Migration                       40m
 
-≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+══ history ═════════════════════════════════════════════
     🟢 Welecja member explainer                       0d
     🟢 Split payment check                            0d
        closed with hook active line                  ?3d
        Fork UX question                              ?2d
        Bitwarden shadow vault                        ?1d
        Competitor UK incorporation
-≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡+7
- s 🧹 5                                                ?
+══════════════════════════════════════════════════════+7
+ c 🧹 5                                                ?
 ```
 Grammar (no legend on screen; `?` key shows it):
-- Top: the **pinned** section, one row per pinned session (`📌` 2 cells in the tree column, then the
-  2-cell status slot: live emoji when the session has a tab, two spaces otherwise), sorted by last
-  activity, newest first, no cap; right column = age since last activity (`m`/`h`/`d`). Then one
-  literal empty line. Omitted entirely (with its blank line) when nothing is pinned.
-- `══ N ═══…` full-width double rule = window N (registry order), then the tabs/splits of that window.
-  After the last window one literal empty line, then `≡` × width (U+2261, 1 cell): below it nothing is
-  open (the backlog). The closing `≡` rule carries `+N` = hidden backlog rows (cap 20; `m` lifts it).
-- Column 0 = cursor gutter: `▶` on the selected row, else space (on a pinned row the `▶` replaces the
-  space after `📌`). Column 1 = tree: `├`/`└` + tab index for tabs; ` ├─`/` └─` for splits; ` └⑂` for a
-  split forked from its tab parent.
-- Status slot is always exactly 2 cells: emoji (⚪🚧🟢🔴) or `▫ ` for codex. Title starts after
-  one space. Titles are truncated to fit with `…`.
+- Every section rule is `══ <title> ` + `═` fill to the width: `📌 pinned`, `window N` (registry order),
+  `history`. The closing rule of history is `═` fill with `+N` right-aligned = hidden rows (cap 40; `m` lifts it).
+  One literal empty line after the pinned section and one before history. The pinned section (rule + rows +
+  blank) is omitted entirely when nothing is pinned.
+- Pinned rows: `📌` (2 cells) in the tree column, then the 2-cell status slot (live emoji when the session has
+  a tab, two spaces otherwise), title; right column = age since last activity (`m`/`h`/`d`); sorted by last
+  activity, newest first, no cap. Pinned sessions never appear in history.
+- Column 0 = cursor gutter: `▶` on the selected row, else space (on a pinned row the `▶` replaces the space
+  after `📌`). Column 1 = tree: `├`/`└` + tab index for tabs; ` ├─`/` └─` for splits; ` └⑂` for a split forked
+  from its tab parent.
+- Status slot is always exactly 2 cells: emoji (⚪🚧🟢🔴) or `▫ ` for codex. Title starts after one space.
+  Titles are truncated to fit with `…`.
 - Right column, right-aligned to width, meaning by row class:
   - active with tab: blank, except 🟢/🔴 rows show how long they have waited (`12m`, `1h`, `2d`).
   - parked with tab: `🧹` + ` Nd` days until wake (blank after broom if someday).
-  - pinned with tab: `🧹 📌` (sweepable: the session lives in the pinned list, the tab is not the session).
+  - pinned with tab: `🧹 📌` (closable: the session lives in the pinned list, the tab is not the session).
   - stale with tab: `🧹 ?Nd` days until auto-archive. Done with tab: `🧹`. Codex without id: `—`.
-  - backlog (no tab): parked `Nd` (`0d` due today, then 🟢 in the status slot), someday blank,
-    unsorted `?Nd`. Pinned sessions never appear in the backlog. Order: due → wake ascending →
-    unsorted by recency → someday by recency.
-- Footer: ` s 🧹 N` (N = sweepable panes among the visible rows) left, `?` right. Nothing else.
-- Width handling: compute cell widths with `unicodedata.east_asian_width` (W/F = 2, everything else 1;
-  U+FE0F, U+200D and combining marks 0). Emoji VS16 sequences must not appear; use the exact code points above.
-- Redraw triggers: inotify (via `ctypes` libc inotify, stdlib only) on current.json, events.jsonl,
-  lineage.json and `*.state` in the claude-tab-status dir; fall back to 2 s polling if inotify is
-  unavailable. Plus a 60 s timer for ages.
+  - history (no tab): parked `Nd` (`0d` due today, then 🟢 in the status slot), someday blank, unsorted `?Nd`.
+    Order: due → wake ascending → unsorted by recency → someday by recency.
+- Footer: ` c 🧹 N` (N = closable panes among the visible rows) left, `?` right. Nothing else.
+- Width handling: `unicodedata.east_asian_width` (W/F = 2, everything else 1; U+FE0F, U+200D and combining
+  marks 0). Emoji VS16 sequences must not appear; use the exact code points above.
+- Redraw triggers: inotify (via `ctypes` libc inotify, stdlib only) on current.json, events.jsonl, lineage.json
+  and `*.state` in the claude-tab-status dir; fall back to 2 s polling if inotify is unavailable. Plus a 60 s
+  timer for ages.
 
 ## Keys
-    j/k or arrows  move      ↵   focus if open, else resume
-    r  resume in new tab     p   park: prompt "days [1]" then "note" (empty ok); Esc cancels
-    x  done                  a   re-activate         i   pin / unpin (toggle)
-    s  sweep all 🧹 panes (confirm with y when N > 3)
+    j/k or arrows  move      ↵   focus hint if open, else resume     r  resume in new tab
+    p  pin / unpin           s   snooze (park): "days [1] or s" then "note"; Esc cancels
+    c  close (sweep) all visible 🧹 panes (confirm with y when N > 3)
+    x  done                  a   re-activate
     /  filter rows by substring (Esc clears)     space  toggle detail pane (bottom 7 rows)
-    D  show done sessions (toggle)               q    quit     ?  help overlay
-Detail pane (when open): title · state · wake; `fork of <title>` · subagents N · cwd · msgs;
-`you  <last prompt, 2 lines>`; `claude <last assistant text, 2 lines>`; `note <park note>`.
+    D  show done sessions    m   whole history    q  quit     ?  help overlay
+Detail pane (when open): title · state · age/wake; note, or `fork of <title>` / subagents N · sid · cwd;
+`you  <last prompt, 2 lines>`; `claude <last assistant text, 2 lines>`.
 
 ## Focus (↵ on an open row) — spike first, then implement the best that works
 Ghostty's app object `/com/mitchellh/ghostty` exposes action `present-surface` (param `t`, uint64

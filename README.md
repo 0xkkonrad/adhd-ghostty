@@ -7,10 +7,11 @@ The centre piece is `sessions`, a 56-column sidebar that treats the **session** 
 unit of account:
 
 ```
+══ 📌 pinned ═══════════════════════════════════════════
 📌 🟢 Lisbon Sailing Research                         2h
 📌    Referral v3 success metric                      5d
 
-══ 1 ═══════════════════════════════════════════════════
+══ window 1 ════════════════════════════════════════════
  ├1 ⚪ LP Refresh Competitor                          🧹
  ├2 🚧 Design system landing page
  ├3 ⚪ Shotgun split tree review                  🧹 ?2d
@@ -21,32 +22,59 @@ unit of account:
  ├5 🟢 Lisbon Sailing Research                     🧹 📌
  ├6 🟢 Stale Docs Cleanup                             🧹
 ▶└7 🚧 Multi-Session Dashboard
-══ 2 ═══════════════════════════════════════════════════
+══ window 2 ════════════════════════════════════════════
  └1 🔴 Welecja Drive Migration                       40m
 
-≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+══ history ═════════════════════════════════════════════
     🟢 Welecja member explainer                       0d
     🟢 Split payment check                            0d
        closed with hook active line                  ?3d
        Fork UX question                              ?2d
        Bitwarden shadow vault                        ?1d
        Competitor UK incorporation
-≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡+7
- s 🧹 5                                                ?
+══════════════════════════════════════════════════════+7
+ c 🧹 5                                                ?
 ```
 
-- Top: `📌` pinned sessions ("keep for later", no date, never decays), newest activity first, age on the right.
-- `══ N ══` window N, `├N` tab N (= Ghostty `alt+N`), `├─` split, `└⑂` split forked from its parent.
+- `══ 📌 pinned ══`: sessions kept for later (no date, never decays), newest activity first, age on the right.
+- `══ window N ══`, `├N` tab N (= Ghostty `alt+N`), `├─` split, `└⑂` split forked from its parent.
 - Left emoji = live status from the Claude Code hook: ⚪ idle, 🚧 working, 🟢 finished (your turn), 🔴 blocked on you.
 - Right column = **your intent**, which outlives the tab: blank = active (🟢/🔴 rows show how long
   they have waited), `Nd` = parked, wakes in N days, `?Nd` = unsorted, auto-archived in N days,
-  🧹 = still holds a tab, `s` closes it (`🧹 📌` = pinned session whose tab can go).
-- Below the `≡` rule: sessions with no tab anywhere, the backlog (cap 20, `m` shows all). `0d` + 🟢 = due today.
+  🧹 = still holds a tab, `c` closes it (`🧹 📌` = pinned session whose tab can go).
+- `══ history ══`: sessions with no tab anywhere (cap 40, `m` shows all). `0d` + 🟢 = due today.
 
-Keys: `j/k` move, `↵` focus/resume, `r` resume in a new tab, `p` park (days, note), `i` pin/unpin, `x` done,
-`a` re-activate, `s` sweep, `/` filter, `space` detail pane, `D` show done, `m` expand backlog, `?` help, `q` quit.
-In a Claude session: `/park [days|s] [note]`, `/pin` (toggle), `/done`. Typing in a parked session re-activates
-it; typing in a pinned session keeps it pinned.
+## Shortcuts
+
+Sidebar keys (cursor moves over session rows only):
+
+| key | action |
+|---|---|
+| `j` / `k`, `↑` / `↓` | move |
+| `↵` | open row: focus hint `→ "window title" · alt+N`; closed row: resume in a new tab |
+| `r` | resume in a new tab (closed rows; on an open row same as `↵`) |
+| `p` | pin / unpin (📌 section at the top, no date, never decays) |
+| `s` | snooze = park: days (number, `s` = someday), then a note |
+| `c` | close = sweep every visible 🧹 pane (confirms above 3) |
+| `x` | done (hidden; `D` shows) |
+| `a` | re-activate |
+| `/` … `↵`, `Esc` | filter rows by text / clear the filter |
+| `space` | detail pane (7 rows; off when the terminal is under 15 rows) |
+| `D` | show done sessions |
+| `m` | whole history (cap 40 otherwise) |
+| `?` | help overlay |
+| `q` | quit |
+
+In a Claude Code session:
+
+| command | action |
+|---|---|
+| `/pin` | pin / unpin this session (toggle) |
+| `/park [days\|s] [note]` | snooze: wake in N days (default 1) or someday |
+| `/done` | mark done |
+| `/fork-here [down]` | fork this session into a new split |
+
+Typing in a parked session re-activates it; typing in a pinned session keeps it pinned.
 
 ## Layout
 
