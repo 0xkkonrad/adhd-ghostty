@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Print the D-Bus window number (/com/mitchellh/ghostty/window/N) of the Ghostty window that shows a
+given Claude Code session, or the focused window.
+
+Usage: ghostty-window-of [--session SID] [--focused] [--list]
+
+Ghostty exposes split-*/new-tab actions per window on D-Bus but nothing that says which window is
+which. GTK numbers the D-Bus windows in creation order and lists them to AT-SPI in the same order, so
+the two lists are matched by rank. A window is identified by its title: Ghostty shows the title of
+the focused surface in the active tab, and ~/.claude/hooks/tab-status.py sets that to
+"<icon> <session title>". Order of resolution:
+  1. --session SID: the single window whose title is that session's title (so the session's tab
+     is the visible one and a split lands next to it);
+  2. --focused (or no unique title match): the window that has keyboard focus;
+  3. otherwise exit 1 with the reason.
+"""
+import argparse, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "claude-tab-status")
+ICON_RE = re.compile(r"^[\U0001F300-\U0001FAFF☀-➿⬀-⯿️]+\s*")
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def dbus_windows():
+    r = subprocess.run(["gdbus", "introspect", "--session", "-d", "com.mitchellh.ghostty",
+                        "-o", "/com/mitchellh/ghostty/window"], capture_output=True, text=True, timeout=20)
+    return sorted(int(n) for n in re.findall(r"node (?:/com/mitchellh/ghostty/window/)?(\d+)\s*\{", r.stdout))
+
+
+def frames():
+    gs = load("ghostty_session", os.path.join(HOME, ".local/bin/ghostty-session"))
+    pids = {int(x) for x in subprocess.run(["pgrep", "-x", "ghostty"], capture_output=True,
+                                           text=True).stdout.split()}
+    return gs.a11y_windows(pids, timeout=8)
+
+
+def strip_icon(t):
+    return ICON_RE.sub("", t or "").strip()
+
+
+def session_titles(sid):
+    """Titles the tab-status hook may be showing for this session (most specific first)."""
+    out = []
+    try:
+        ts = load("tab_status", os.path.join(HOME, ".claude/hooks/tab-status.py"))
+        proj = os.path.join(HOME, ".claude/projects")
+        tp = ""
+        for d in os.listdir(proj):
+            p = os.path.join(proj, d, sid + ".jsonl")
+            if os.path.exists(p):
+                tp = p
+                break
+        # like ts.transcript_title but over the whole file: a /rename may be far from the tail
+        found = {}
+        if tp:
+            with open(tp, "rb") as f:
+                data = f.read().decode("utf-8", "replace")
+            for m in re.finditer(r'\{"type":"(custom-title|ai-title)","(?:customTitle|aiTitle)":"((?:[^"\\]|\\.)*)"', data):
+                found[m.group(1)] = m.group(2)
+        raw = found.get("custom-title") or found.get("ai-title")
+        if raw:
+            try:
+                raw = json.loads(f'"{raw}"')
+            except ValueError:
+                pass
+            out.append(ts.clean(raw, ts.TITLE_MAX))
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(STATE, sid + ".title")) as f:
+            t = f.read().strip()
+        if t and t not in out:
+            out.append(t)
+    except OSError:
+        pass
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--session", help="Claude Code session id (defaults to $CLAUDE_CODE_SESSION_ID)")
+    ap.add_argument("--focused", action="store_true", help="only use keyboard focus")
+    ap.add_argument("--list", action="store_true", help="print every window with its number")
+    a = ap.parse_args()
+
+    wins = frames()
+    if wins is None:
+        sys.exit("ghostty-window-of: AT-SPI unavailable (python3-gi + at-spi needed)")
+    nums = dbus_windows()
+    for _ in range(10):                     # a new window shows up on D-Bus a little late
+        if len(nums) >= len(wins):
+            break
+        time.sleep(0.5)
+        nums = dbus_windows()
+    if len(nums) != len(wins):
+        sys.exit(f"ghostty-window-of: {len(wins)} windows on AT-SPI but {len(nums)} on D-Bus ({nums}); "
+                 "cannot match them — set GHOSTTY_SPLIT_WINDOW=<n> by hand")
+    rows = [{"window": n, "title": w["title"], "focused": bool(w.get("focused")),
+             "tabs": w.get("tabs", []), "active": w.get("active")} for n, w in zip(nums, wins)]
+    if a.list:
+        for r in rows:
+            print(f"{r['window']:>3}  {'*' if r['focused'] else ' '}  {r['title']}")
+        return
+
+    sid = a.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid and not a.focused:
+        titles = session_titles(sid)
+        hits = [r for r in rows if strip_icon(r["title"]) in titles]
+        if len(hits) == 1:
+            print(hits[0]["window"])
+            return
+        if len(hits) > 1:
+            print(f"ghostty-window-of: title {titles[0]!r} is visible in windows "
+                  f"{[h['window'] for h in hits]}; using the focused one", file=sys.stderr)
+            foc = [h for h in hits if h["focused"]]
+            if len(foc) == 1:
+                print(foc[0]["window"])
+                return
+        else:
+            # the session's tab is in some window but not the visible one: a split would land elsewhere
+            tabbed = [r for r in rows if any(strip_icon(t) in titles for t in r["tabs"])]
+            if tabbed and titles:
+                sys.exit(f"ghostty-window-of: session title {titles[0]!r} is a background tab of window "
+                         f"{tabbed[0]['window']} ({tabbed[0]['title']!r}); switch to that tab and retry")
+            print(f"ghostty-window-of: no window titled {titles or sid!r}; falling back to the focused window",
+                  file=sys.stderr)
+    foc = [r for r in rows if r["focused"]]
+    if len(foc) == 1:
+        print(foc[0]["window"])
+        return
+    sys.exit("ghostty-window-of: no Ghostty window has keyboard focus and no title match; "
+             "click into the target window and retry, or set GHOSTTY_SPLIT_WINDOW=<n> "
+             f"(windows: {[(r['window'], r['title']) for r in rows]})")
+
+
+if __name__ == "__main__":
+    main()

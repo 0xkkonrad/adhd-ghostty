@@ -1,0 +1,1339 @@
+#!/usr/bin/env python3
+"""ghostty-session — remember what is open in Ghostty (windows → tabs → splits, and the
+claude / codex / tmux / shell inside each split) and reopen it after a crash or at login.
+
+  ghostty-session save              snapshot the live state (the systemd timer runs this every 20 s)
+  ghostty-session show [FILE]       print a snapshot (default: the current one)
+  ghostty-session restore [FILE] [--window N | --new-window] [--dry-run] [--include-running]
+                                    rebuild the snapshot with real Ghostty tabs + splits
+  ghostty-session on-login          what the login service runs: restore the last snapshot once
+  ghostty-session closed            list windows that were closed (newest first)
+  ghostty-session reopen [N] [--batch] [--window W | --new-window]
+                                    reopen the N-th last closed window (default: the last one) in a
+                                    new window; --batch = every window closed at the same moment
+  ghostty-session cold-start PID    ~/.bashrc calls this from a fresh shell when Ghostty has exactly
+                                    one surface: reopens the last closed windows of this boot into it
+  ghostty-session install|uninstall systemd user timer + login service + GNOME key Super+Shift+T
+
+How it works (Ghostty 1.3.1 on GNOME/Wayland, no root):
+  * what runs where: /proc — every Ghostty surface is a `/bin/sh -c /bin/bash` child of the
+    ghostty process; its descendants tell us claude (session id from ~/.claude/sessions/<pid>.json),
+    codex (thread id from the open rollout file), tmux (session name) or a plain shell (cwd).
+  * tabs: the GTK accessibility tree (AT-SPI, needs org.gnome.desktop.interface toolkit-accessibility=true)
+    exposes the tab bar (all tab titles, in order) and the split geometry of the *visible* tab only.
+    So tab membership is learned when a surface first appears: new tab count → it is a new tab,
+    otherwise it is a split of the active tab (right if it is full-height, else down).
+  * restore: GTK actions over D-Bus (new-window on the app, new-tab / split-right / split-down on
+    /com/mitchellh/ghostty/window/N). Each new surface starts a plain bash; ~/.bashrc picks up the
+    command from $XDG_RUNTIME_DIR/ghostty-split-run/pending (same hand-over as ghostty-split-run).
+  * closing: a window whose surfaces all vanish between two ticks is appended to closed.json with its
+    last layout. Closing the last window never empties current.json (login restore still works), and
+    the next fresh Ghostty shell (~/.bashrc → cold-start) rebuilds the closed windows automatically.
+State: ~/.local/state/ghostty-session/{current.json,registry.json,closed.json,history/}
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "ghostty-session"
+CUR = STATE / "current.json"
+REG = STATE / "registry.json"
+HIST = STATE / "history"
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+TITLES = RUNTIME / "claude-tab-status"          # <sid>.title written by ~/.claude/hooks/tab-status.py
+PENDING_DIR = RUNTIME / "ghostty-split-run"
+PENDING = PENDING_DIR / "pending"
+BUS, OBJ = "com.mitchellh.ghostty", "/com/mitchellh/ghostty"
+CLAUDE_SESSIONS = HOME / ".claude/sessions"
+CODEX_LOCKS = HOME / ".codex/thread-writer-locks"
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+CLOSED = STATE / "closed.json"      # windows that were closed, newest last (for `reopen` / cold-start)
+RESTORING = STATE / "restoring"     # pid of a restore in progress
+LOCK = STATE / "lock"
+CLOSED_KEEP = 30
+HISTORY_EVERY = 600        # s between history copies
+HISTORY_KEEP = 60
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+# ----------------------------------------------------------------------------- processes
+def read(p, default=""):
+    try:
+        return Path(p).read_text()
+    except OSError:
+        return default
+
+
+def clk_tck():
+    return os.sysconf("SC_CLK_TCK")
+
+
+def boot_time():
+    for l in read("/proc/stat").splitlines():
+        if l.startswith("btime "):
+            return int(l.split()[1])
+    return 0
+
+
+def scan_procs():
+    """pid -> {ppid, comm, cmd[], start(epoch), cwd}"""
+    procs, bt, tck = {}, boot_time(), clk_tck()
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        pid = int(d)
+        st = read(f"/proc/{pid}/stat")
+        if not st:
+            continue
+        try:
+            comm = st[st.index("(") + 1:st.rindex(")")]
+            rest = st[st.rindex(")") + 2:].split()
+            ppid, start = int(rest[1]), bt + int(rest[19]) / tck
+        except (ValueError, IndexError):
+            continue
+        cmd = read(f"/proc/{pid}/cmdline").split("\0")
+        cmd = [c for c in cmd if c] or [comm]
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = None
+        procs[pid] = {"pid": pid, "ppid": ppid, "comm": comm, "cmd": cmd, "start": start, "cwd": cwd}
+    kids = {}
+    for p in procs.values():
+        kids.setdefault(p["ppid"], []).append(p["pid"])
+    for p in procs.values():
+        p["kids"] = sorted(kids.get(p["pid"], []))
+    return procs
+
+
+def descendants(procs, pid):
+    out, stack = [], list(procs[pid]["kids"])
+    while stack:
+        c = stack.pop(0)
+        if c in procs:
+            out.append(c)
+            stack.extend(procs[c]["kids"])
+    return out
+
+
+def tty_of(pid):
+    try:
+        t = os.readlink(f"/proc/{pid}/fd/0")
+        return t if t.startswith("/dev/pts/") else None
+    except OSError:
+        return None
+
+
+def winsize(tty):
+    import fcntl, struct, termios
+    try:
+        fd = os.open(tty, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            r, c, xp, yp = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+        finally:
+            os.close(fd)
+        return {"rows": r, "cols": c, "px_w": xp, "px_h": yp}
+    except OSError:
+        return None
+
+
+def fd_paths(pid):
+    try:
+        return [os.readlink(f"/proc/{pid}/fd/{f}") for f in os.listdir(f"/proc/{pid}/fd")]
+    except OSError:
+        return []
+
+
+def claude_sessions_by_pid():
+    out = {}
+    for f in glob.glob(str(CLAUDE_SESSIONS / "*.json")):
+        try:
+            s = json.loads(Path(f).read_text())
+            out[int(s["pid"])] = s
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return out
+
+
+def base(cmd):
+    return os.path.basename(cmd[0]) if cmd else ""
+
+
+def sessions_argv(cmd):
+    """True for `python3 [-flags…] …/sessions tui` (the sidebar), e.g. python3 -I ~/.local/bin/sessions tui."""
+    args = list(cmd[1:])
+    while args and args[0].startswith("-"):
+        args = args[1:]
+    return len(args) > 1 and os.path.basename(args[0]) == "sessions" and args[1] == "tui"
+
+
+def classify(procs, root, csess):
+    """What runs in the surface rooted at `root` (the /bin/sh child of ghostty)."""
+    desc = descendants(procs, root)
+    shells = [p for p in [root] + desc if base(procs[p]["cmd"]) in ("bash", "sh", "zsh", "fish")]
+    for p in [root] + desc:
+        pr = procs[p]
+        b = base(pr["cmd"])
+        if b == "claude" and "-p" not in pr["cmd"] and "--print" not in pr["cmd"]:
+            s = csess.get(p)
+            sid = s.get("sessionId") if s else None
+            if not sid:
+                for i, a in enumerate(pr["cmd"]):
+                    if a in ("-r", "--resume") and i + 1 < len(pr["cmd"]) and UUID_RE.fullmatch(pr["cmd"][i + 1]):
+                        sid = pr["cmd"][i + 1]
+            return {"kind": "claude", "id": sid, "cwd": (s or {}).get("cwd") or pr["cwd"], "pid": p,
+                    "label": title_for(sid)}
+        if b in ("python3", "python") and sessions_argv(pr["cmd"]):
+            return {"kind": "sessions", "id": None, "cwd": pr["cwd"], "pid": p, "label": "sessions"}
+        if b == "codex":
+            tid = None
+            for i, a in enumerate(pr["cmd"]):
+                if a == "resume" and i + 1 < len(pr["cmd"]) and UUID_RE.fullmatch(pr["cmd"][i + 1]):
+                    tid = pr["cmd"][i + 1]
+            if not tid:
+                for fp in fd_paths(p):
+                    m = UUID_RE.search(os.path.basename(fp)) if ("rollout-" in fp or "thread-writer-locks" in fp) else None
+                    if m:
+                        tid = m.group(0)
+                        break
+            return {"kind": "codex", "id": tid, "cwd": pr["cwd"], "pid": p, "label": None}
+        if b == "tmux" and any(a in ("attach", "attach-session", "a", "new", "new-session") for a in pr["cmd"]):
+            name = None
+            for i, a in enumerate(pr["cmd"]):
+                if a in ("-t", "-s") and i + 1 < len(pr["cmd"]):
+                    name = pr["cmd"][i + 1]
+            return {"kind": "tmux", "id": name, "cwd": pr["cwd"], "pid": p, "label": None}
+    # plain shell: cwd of the deepest shell, plus whatever runs in the foreground (info only)
+    sh = shells[-1] if shells else root
+    fg = [p for p in procs[sh]["kids"] if p in procs]
+    fgcmd = " ".join(procs[fg[-1]]["cmd"])[:120] if fg else None
+    return {"kind": "shell", "id": None, "cwd": procs[sh]["cwd"], "pid": sh, "label": fgcmd}
+
+
+def title_for(sid):
+    if not sid:
+        return None
+    t = read(TITLES / f"{sid}.title").strip()
+    return t or None
+
+
+def live_surfaces():
+    procs = scan_procs()
+    csess = claude_sessions_by_pid()
+    apps = [p for p in procs.values() if p["comm"] == "ghostty" and
+            any(base(procs[k]["cmd"]) in ("sh", "bash") for k in p["kids"] if k in procs)]
+    out = []
+    for app in apps:
+        for k in app["kids"]:
+            pr = procs.get(k)
+            if not pr or base(pr["cmd"]) not in ("sh", "bash"):
+                continue
+            tty = tty_of(k)
+            s = {"pid": k, "start": round(pr["start"], 2), "app_pid": app["pid"], "tty": tty,
+                 "size": winsize(tty) if tty else None, "program": classify(procs, k, csess)}
+            out.append(s)
+    out.sort(key=lambda s: (s["start"], s["pid"]))
+    return out
+
+
+# ----------------------------------------------------------------------------- accessibility
+def a11y_windows(app_pids, timeout=8):
+    """[{title, tabs:[str], active:int|None, terminals:[(x,y,w,h)]}] per Ghostty window, or None."""
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+    except Exception:
+        return None
+    try:
+        Atspi.set_timeout(1500, 5000)
+    except Exception:
+        pass
+
+    def alarm(*_):
+        raise TimeoutError("AT-SPI walk timed out")
+    old = signal.signal(signal.SIGALRM, alarm)
+    signal.alarm(timeout)
+    try:
+        desk = Atspi.get_desktop(0)
+        wins = []
+        for i in range(desk.get_child_count()):
+            app = desk.get_child_at_index(i)
+            try:
+                if app.get_process_id() not in app_pids:
+                    continue
+            except Exception:
+                continue
+            for j in range(app.get_child_count()):
+                fr = app.get_child_at_index(j)
+                if fr.get_role_name() != "frame":
+                    continue
+                w = {"title": fr.get_name() or "", "tabs": [], "active": None, "terminals": [], "focused": False}
+                try:
+                    w["focused"] = fr.get_state_set().contains(Atspi.StateType.ACTIVE)
+                except Exception:
+                    pass
+                tabs, terms = [], []
+                _walk_frame(fr, tabs, terms, Atspi)
+                w["tabs"] = [t[0] for t in tabs]
+                sel = [k for k, t in enumerate(tabs) if t[1]]
+                w["active"] = sel[0] if sel else (w["tabs"].index(w["title"]) if w["title"] in w["tabs"] else None)
+                if not w["tabs"]:
+                    w["active"] = 0      # single tab, no tab bar: the frame title is that tab's title
+                seen = set()
+                for r in terms:
+                    if r not in seen:
+                        seen.add(r)
+                        w["terminals"].append(r)
+                wins.append(w)
+        return wins
+    except Exception as e:
+        log("a11y:", e)
+        return None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _walk_frame(o, tabs, terms, Atspi, depth=0, in_tabbar=False):
+    try:
+        role, n = o.get_role_name(), o.get_child_count()
+    except Exception:
+        return
+    if role == "page tab":
+        selected = False
+        try:
+            selected = o.get_state_set().contains(Atspi.StateType.SELECTED)
+        except Exception:
+            pass
+        tabs.append((o.get_name() or "", selected))
+        return
+    if role == "page tab list":
+        in_tabbar = True
+    if role == "scroll pane" and not in_tabbar:
+        # a terminal surface = scroll pane that does not hold the tab list
+        holds_tabs = False
+        for i in range(min(n, 4)):
+            c = o.get_child_at_index(i)
+            if c and c.get_role_name() == "page tab list":
+                holds_tabs = True
+        if not holds_tabs:
+            try:
+                r = o.get_extents(Atspi.CoordType.WINDOW)
+                if r.width > 50 and r.height > 50:
+                    terms.append((r.x, r.y, r.width, r.height))
+            except Exception:
+                pass
+            return
+    if depth > 40:
+        return
+    for i in range(min(n, 120)):
+        c = o.get_child_at_index(i)
+        if c:
+            _walk_frame(c, tabs, terms, Atspi, depth + 1, in_tabbar)
+
+
+# ----------------------------------------------------------------------------- snapshot
+def boot_id():
+    return read("/proc/sys/kernel/random/boot_id").strip()
+
+
+def uptime_s():
+    try:
+        return float(read("/proc/uptime").split()[0])
+    except Exception:
+        return 1e9
+
+
+def load_json(p, default):
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, data):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    try:
+        dfd = os.open(p.parent, os.O_RDONLY)
+        os.fsync(dfd)
+        os.close(dfd)
+    except OSError:
+        pass
+
+
+def skey(s):
+    return f"{s['pid']}:{s['start']}"
+
+
+class lock:
+    """serialises registry writers (timer save, cold-start save, restore's register)"""
+    def __enter__(self):
+        STATE.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def strip_icon(t):
+    return re.sub(r"^[☀-⟿\U0001F300-\U0001FAFF️\s]+", "", t or "").strip()
+
+
+def nearest_rect(size, rects):
+    """a11y terminal rect whose size is closest to the pty's pixel size (padding makes them differ a bit)"""
+    if not size or not rects:
+        return None
+    return min(rects, key=lambda r: abs(r[2] - size["px_w"]) + abs(r[3] - size["px_h"]))
+
+
+def split_dir(s, prev, rects, max_h):
+    """Direction of the split that created surface s, given the previous surface of the same tab.
+    Prefer the geometry of the visible tab; fall back to 'full height = right split'."""
+    is_sidebar = (s.get("program") or {}).get("kind") == "sessions"      # only the sidebar may be a left split
+    a = nearest_rect((prev or {}).get("size"), rects) if prev else None
+    b = nearest_rect(s.get("size"), rects)
+    if a and b and a != b:
+        if abs(b[0] - a[0]) < 8 and b[1] != a[1]:
+            return "down"
+        if abs(b[1] - a[1]) < 8 and b[0] != a[0]:
+            return "right" if (b[0] > a[0] or not is_sidebar) else "left"
+        return "right" if b[0] > a[0] else ("left" if (b[0] < a[0] and is_sidebar) else "down")
+    h = (s.get("size") or {}).get("px_h", 0)
+    return "right" if (max_h and h >= 0.8 * max_h) else "down"
+
+
+def surface_title(s):
+    """What Ghostty shows as this surface's title (icon stripped): claude → tab-status title,
+    shell → bash's "⚪ \\w" / "🚧 <cmd>" (see ~/.bashrc). codex/tmux: unknown."""
+    p = s["program"]
+    k = p.get("kind")
+    if k == "claude":
+        t = p.get("label") or title_for(p.get("id"))
+        return strip_icon(t) if t else None
+    if k == "sessions":
+        return "sessions"
+    if k == "shell":
+        if p.get("label"):
+            return p["label"][:60]
+        cwd = p.get("cwd") or ""
+        home = str(HOME)
+        return ("~" + cwd[len(home):]) if cwd == home or cwd.startswith(home + "/") else cwd
+    return None
+
+
+def reconcile(reg, surfaces, wins, fi):
+    """Rebuild reg["windows"] from the a11y frames: one registry window per frame, one tab slot per
+    a11y tab, each slot anchored by the surface whose title matches. A surface's tab-mates (splits)
+    follow it. Old tabs that match no slot fill the window's empty slots, else merge into its last tab.
+    Returns (windows, empty_slots) where a slot is None in windows[wi]["tabs"][si]."""
+    reg_s = reg["surfaces"]
+    by_key = {skey(s): s for s in surfaces}
+    old_windows = reg["windows"]
+    old_tab_win = {t["id"]: wi for wi, w in enumerate(old_windows) for t in w["tabs"]}
+    titles = {k: surface_title(by_key[k]) for k in by_key}
+    windows = [{"id": None, "tabs": [None] * len(aw["tabs"] or [aw["title"]]),
+                "slot_titles": [strip_icon(t) for t in (aw["tabs"] or [aw["title"]])]} for aw in wins]
+    assigned, claimed = {}, {}        # surface key → (wi, si);  old tab id → (wi, si)
+
+    def pref(k, wi):
+        v = reg_s.get(k)
+        ow = old_tab_win.get(v["tab"]) if v else None
+        return (0 if ow == wi else 1 if ow is not None else 2, v["seq"] if v else 1e18)
+
+    for wi, w in enumerate(windows):
+        for si, want in enumerate(w["slot_titles"]):
+            if not want:
+                continue
+            cands = [k for k in by_key if k not in assigned and titles.get(k) == want]
+            if not cands:
+                continue
+            k = min(cands, key=lambda k: pref(k, wi))
+            assigned[k] = (wi, si)
+            v = reg_s.get(k)
+            if v and v["tab"] not in claimed:
+                claimed[v["tab"]] = (wi, si)
+
+    def new_tab(wi, si):
+        reg["seq"] += 1
+        windows[wi]["tabs"][si] = {"id": f"t{reg['seq']}", "title": ""}
+        return windows[wi]["tabs"][si]["id"]
+
+    # anchors and their tab-mates
+    moved = {}                        # old tab id → new tab id
+    for k, (wi, si) in assigned.items():
+        v = reg_s.get(k)
+        old_tab = v["tab"] if v else None
+        if old_tab is not None and claimed.get(old_tab) == (wi, si):
+            if windows[wi]["tabs"][si] is None:
+                windows[wi]["tabs"][si] = {"id": old_tab, "title": ""}
+                moved[old_tab] = old_tab
+            continue
+        tid = new_tab(wi, si) if windows[wi]["tabs"][si] is None else windows[wi]["tabs"][si]["id"]
+        reg_s[k] = {"tab": tid, "kind": "tab", "dir": None, "seq": v["seq"] if v else reg["seq"]}
+    def empty_slots():
+        return [(wi, si) for wi, w in enumerate(windows) for si, t in enumerate(w["tabs"]) if t is None]
+
+    def fits(k, r):
+        sz = by_key[k].get("size") or {}
+        return sz and abs(sz["px_w"] - r[2]) <= 80 and abs(sz["px_h"] - r[3]) <= 80
+
+    # verify each frame's VISIBLE tab against its terminal rectangles (the only geometry AT-SPI exposes):
+    # members whose pty size matches no rectangle cannot be there → unplaced; rectangles with no member
+    # pull in a surface of that size from elsewhere (only when the match is unambiguous).
+    anchors = {k: slot for k, slot in assigned.items()}
+    unplaced = []
+    for wi, aw in enumerate(wins):
+        ai = aw["active"]
+        if ai is None or ai >= len(windows[wi]["tabs"]) or windows[wi]["tabs"][ai] is None or not aw["terminals"]:
+            continue
+        tid = windows[wi]["tabs"][ai]["id"]
+        members = sorted((k for k, v in reg_s.items() if v["tab"] == tid and k in by_key), key=lambda k: reg_s[k]["seq"])
+        rects = list(aw["terminals"])
+        for k in members:
+            r = next((r for r in rects if fits(k, r)), None)
+            if r:
+                rects.remove(r)
+            elif anchors.get(k) != (wi, ai):
+                unplaced.append(k)
+        if rects:
+            slot_ids = {t["id"] for w in windows for t in w["tabs"][:len(w["slot_titles"])] if t}
+
+            def rank(k):
+                v = reg_s.get(k, {})
+                return (0 if k in unplaced else 1 if v.get("tab") not in slot_ids else
+                        2 if old_tab_win.get(v.get("tab")) == wi else 3, v.get("seq", 1e18))
+            cands = sorted((k for k in by_key if k not in anchors and (k in unplaced or reg_s.get(k, {}).get("tab") != tid)
+                            and any(fits(k, r) for r in rects)), key=rank)
+            if len(cands) > len(rects):      # ambiguous: only pull in surfaces that are certainly misfiled
+                cands = [k for k in cands if rank(k)[0] == 0][:len(rects)]
+            if cands:
+                for k in cands:
+                    if k in unplaced:
+                        unplaced.remove(k)
+                    reg_s[k] = {"tab": tid, "kind": "split", "dir": reg_s.get(k, {}).get("dir") or "right",
+                                "seq": reg_s[k]["seq"] if k in reg_s else reg["seq"]}
+    # old tabs nobody claimed keep their members: an empty slot of their window, else an extra tab at its end
+    def place_tab(tab, wi_hint):
+        wi = wi_hint if wi_hint < len(windows) else (fi if fi is not None else len(windows) - 1)
+        es = [e for e in empty_slots() if e[0] == wi] or [e for e in empty_slots() if e[0] == fi] or empty_slots()
+        if es:
+            windows[es[0][0]]["tabs"][es[0][1]] = tab
+        else:
+            windows[wi]["tabs"].append(tab)
+        moved[tab["id"]] = tab["id"]
+
+    for wi_old, ow in enumerate(old_windows):
+        for t in ow["tabs"]:
+            if t["id"] in claimed or t["id"] in moved:
+                continue
+            if any(v["tab"] == t["id"] and k in by_key and k not in unplaced for k, v in reg_s.items()):
+                place_tab({"id": t["id"], "title": ""}, wi_old)
+    for k in unplaced:
+        reg["seq"] += 1
+        wi_hint = old_tab_win.get(reg_s[k]["tab"], 0)
+        tab = {"id": f"t{reg['seq']}", "title": ""}
+        reg_s[k] = {"tab": tab["id"], "kind": "tab", "dir": None, "seq": reg_s[k]["seq"]}
+        place_tab(tab, wi_hint)
+    # exactly one "tab" anchor per tab: the oldest member
+    live_tabs = {t["id"] for w in windows for t in w["tabs"] if t}
+    for tid in live_tabs:
+        members = sorted((k for k, v in reg_s.items() if v["tab"] == tid), key=lambda k: reg_s[k]["seq"])
+        for i, k in enumerate(members):
+            reg_s[k]["kind"] = "tab" if i == 0 else "split"
+            if i == 0:
+                reg_s[k]["dir"] = None
+            elif not reg_s[k].get("dir"):
+                reg_s[k]["dir"] = "right"
+    # window ids: keep the old id most of a window's tabs came from
+    used = set()
+    for wi, w in enumerate(windows):
+        votes = {}
+        for t in w["tabs"]:
+            if t and t["id"] in old_tab_win:
+                oid = old_windows[old_tab_win[t["id"]]]["id"]
+                votes[oid] = votes.get(oid, 0) + 1
+        best = max(votes, key=votes.get) if votes else None
+        if best is None or best in used:
+            reg["seq"] += 1
+            best = f"w{reg['seq']}"
+        used.add(best)
+        w["id"] = best
+    return windows, empty_slots()
+
+
+def save():
+    now = time.time()
+    surfaces = live_surfaces()
+    reg = load_json(REG, {})
+    if reg.get("boot_id") != boot_id() or "windows" not in reg:
+        reg = {"boot_id": boot_id(), "seq": 0, "surfaces": {}, "windows": []}
+    wins = a11y_windows({s["app_pid"] for s in surfaces}) if surfaces else []
+    a11y_ok = wins is not None
+    wins = wins or []
+
+    live = {skey(s): s for s in surfaces}
+    reg_s = reg["surfaces"]
+    prev = load_json(CUR, {})
+    record_closed_windows(reg, live, prev, now)
+    for k in list(reg_s):
+        if k not in live:
+            del reg_s[k]
+    focused = [i for i, w in enumerate(wins) if w.get("focused")] or \
+              [i for i, w in enumerate(wins) if w["title"] not in ("", "Ghostty")]
+    fi = focused[0] if focused else None
+    if a11y_ok and wins:
+        windows, empty = reconcile(reg, surfaces, wins, fi)
+    else:
+        windows, empty = [], []
+        for w in reg["windows"]:
+            tabs = [t for t in w["tabs"] if any(v["tab"] == t["id"] for v in reg_s.values())]
+            if tabs:
+                w["tabs"] = tabs
+                windows.append(w)
+    new = [s for s in surfaces if skey(s) not in reg_s]
+    max_h = max([s["size"]["px_h"] for s in surfaces if s.get("size")] or [0])
+    for s in new:
+        reg["seq"] += 1
+        k = skey(s)
+        if a11y_ok and wins:
+            # a new surface: the active tab of the focused window if that slot is unfilled (a new tab),
+            # else any unfilled slot, else a split of the focused window's active tab
+            slot = None
+            if fi is not None:
+                ai = wins[fi]["active"]
+                mine = [e for e in empty if e[0] == fi]
+                slot = (fi, ai) if (fi, ai) in empty else (mine[0] if mine else None)
+            if slot is None and empty:
+                slot = empty[0]
+            if slot is not None:
+                empty.remove(slot)
+                tid = f"t{reg['seq']}"
+                windows[slot[0]]["tabs"][slot[1]] = {"id": tid, "title": ""}
+                reg_s[k] = {"tab": tid, "kind": "tab", "dir": None, "seq": reg["seq"]}
+                continue
+            wi = fi if fi is not None else len(windows) - 1
+            aw, tabs, ai = wins[wi], windows[wi]["tabs"], wins[wi]["active"]
+            sz = s.get("size") or {}
+            if now - s["start"] < 6 and sz and not any(abs(sz["px_w"] - r[2]) <= 80 and abs(sz["px_h"] - r[3]) <= 80
+                                                       for r in aw["terminals"]):
+                # brand new and not in the focused window's visible tab: its own window/tab is not in the
+                # a11y tree yet — leave it for the next tick instead of filing it as a split
+                reg["seq"] -= 1
+                continue
+            if ai is not None and ai < len(tabs) and tabs[ai] is not None:
+                tid = tabs[ai]["id"]
+                prev_s = [x for x in surfaces if skey(x) in reg_s and reg_s[skey(x)]["tab"] == tid]
+                prev_s = max(prev_s, key=lambda x: reg_s[skey(x)]["seq"]) if prev_s else None
+                d = split_dir(s, prev_s, aw["terminals"], max_h)
+                reg_s[k] = {"tab": tid, "kind": "split", "dir": d, "seq": reg["seq"]}
+                continue
+            tid = f"t{reg['seq']}"
+            tabs.append({"id": tid, "title": ""})
+            reg_s[k] = {"tab": tid, "kind": "tab", "dir": None, "seq": reg["seq"]}
+        else:
+            if not windows:
+                windows.append({"id": "w1", "tabs": []})
+            tid = f"t{reg['seq']}"
+            windows[-1]["tabs"].append({"id": tid, "title": ""})
+            reg_s[k] = {"tab": tid, "kind": "tab", "dir": None, "seq": reg["seq"]}
+    # finalize: drop unfilled slots, copy titles from the tab bar
+    final = []
+    for wi, w in enumerate(windows):
+        aw = wins[wi] if wi < len(wins) else None
+        slot_titles = (aw["tabs"] or [aw["title"]]) if aw else []
+        tabs = []
+        for si, t in enumerate(w["tabs"]):
+            if t is None:
+                continue
+            if si < len(slot_titles) and len(w["tabs"]) == len(slot_titles):
+                t["title"] = slot_titles[si]
+            tabs.append(t)
+        w.pop("slot_titles", None)
+        if not tabs:
+            continue
+        w["tabs"] = tabs
+        w["title"] = (aw or {}).get("title", "")
+        w["active_tab"] = (aw or {}).get("active")
+        w["focused"] = bool((aw or {}).get("focused"))
+        final.append(w)
+    windows = final
+    reg["windows"] = windows
+    reg["a11y"] = a11y_ok
+    reg["updated"] = now
+
+    # build the snapshot
+    win_entries = []
+    for w in windows:
+        tab_entries = []
+        for i, t in enumerate(w["tabs"]):
+            members = sorted((s for s in surfaces if reg_s[skey(s)]["tab"] == t["id"]), key=lambda s: reg_s[skey(s)]["seq"])
+            tab_entries.append({
+                "title": t["title"], "active": (w.get("active_tab") == i),
+                "surfaces": [dict(program=s["program"], pid=s["pid"], tty=s["tty"], size=s["size"],
+                                  dir=reg_s[skey(s)]["dir"], seq=reg_s[skey(s)]["seq"]) for s in members]})
+        win_entries.append({"title": w.get("title", ""), "focused": w.get("focused", False), "tabs": tab_entries})
+    snap = {"saved_at": now, "saved_at_iso": time.strftime("%Y-%m-%d %H:%M:%S"), "boot_id": boot_id(),
+            "a11y": a11y_ok, "windows": win_entries}
+
+    write_json(REG, reg)
+    if not surfaces and prev.get("windows"):
+        # nothing open: keep the last populated snapshot — the login restore and cold-start reopen it
+        return prev
+    if (prev.get("windows") and prev.get("boot_id") != boot_id()
+            and prev.get("restored_boot") != boot_id() and uptime_s() < 900):
+        # fresh boot and the pre-boot snapshot has not been consumed by on-login yet: never let the
+        # first post-boot ticks (one empty window) overwrite it (19 Oct 2026: a crash restore reopened 1 shell)
+        return prev
+    write_json(CUR, snap)
+    HIST.mkdir(parents=True, exist_ok=True)
+    hist = sorted(HIST.glob("snap-*.json"))
+    if not hist or now - hist[-1].stat().st_mtime > HISTORY_EVERY:
+        shutil.copy(CUR, HIST / time.strftime("snap-%Y%m%d-%H%M%S.json"))
+        for old in hist[:-HISTORY_KEEP]:
+            old.unlink(missing_ok=True)
+    return snap
+
+
+def record_closed_windows(reg, live, prev, now):
+    """Registry windows whose every surface vanished since the last tick: append their last snapshot
+    layout to closed.json (newest last) so `reopen` / cold-start can bring them back."""
+    reg_s = reg["surfaces"]
+    gone = []
+    for w in reg["windows"]:
+        tabs = {t["id"] for t in w["tabs"]}
+        members = [k for k, v in reg_s.items() if v["tab"] in tabs]
+        if not members or any(k in live for k in members):
+            continue
+        pids = {int(k.split(":")[0]) for k in members}
+        for pw in prev.get("windows", []):
+            if pids & {s["pid"] for t in pw["tabs"] for s in t["surfaces"]}:
+                gone.append(pw)
+                break
+    if not gone:
+        return
+    closed = load_json(CLOSED, {"entries": []})
+    for pw in gone:
+        closed["entries"].append({"closed_at": now, "closed_at_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                  "boot_id": boot_id(), "batch": int(now), "title": pw.get("title", ""),
+                                  "tabs": pw["tabs"]})
+    closed["entries"] = closed["entries"][-CLOSED_KEEP:]
+    write_json(CLOSED, closed)
+    log(f"{len(gone)} window(s) closed, recorded in {CLOSED}")
+
+
+# ----------------------------------------------------------------------------- show
+def describe(p):
+    k = p.get("kind")
+    cwd = (p.get("cwd") or "").replace(str(HOME), "~")
+    if k == "claude":
+        return f"claude {p.get('id') or '?'}  {p.get('label') or ''}  ({cwd})".rstrip()
+    if k == "codex":
+        return f"codex {p.get('id') or '?'}  ({cwd})"
+    if k == "sessions":
+        return "sessions (sidebar)"
+    if k == "tmux":
+        return f"tmux {p.get('id') or '?'}"
+    return f"shell {cwd}" + (f"  [{p['label']}]" if p.get("label") else "")
+
+
+def show(path=None):
+    snap = load_json(path or CUR, None)
+    if not snap:
+        print("no snapshot at", path or CUR)
+        return 1
+    print(f"snapshot {snap.get('saved_at_iso')}  a11y={'yes' if snap.get('a11y') else 'no'}")
+    for wi, w in enumerate(snap.get("windows", []), 1):
+        print(f"window {wi}: {w.get('title', '')}")
+        for ti, t in enumerate(w["tabs"], 1):
+            print(f"  tab {ti}{' *' if t.get('active') else ''}: {t.get('title') or ''}")
+            for s in t["surfaces"]:
+                arrow = {"right": "→", "down": "↓", "left": "←"}.get(s.get("dir")) or "•"
+                print(f"     {arrow} {describe(s['program'])}")
+    return 0
+
+
+# ----------------------------------------------------------------------------- restore
+def gdbus(*args, check=True):
+    r = subprocess.run(["gdbus"] + list(args), capture_output=True, text=True, timeout=20)
+    if check and r.returncode:
+        raise RuntimeError(f"gdbus {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def window_numbers():
+    out = gdbus("introspect", "--session", "-d", BUS, "-o", f"{OBJ}/window", check=False)
+    # gdbus prints child nodes as "node 12 {" (relative) or with the full path depending on version
+    return sorted(int(n) for n in re.findall(r"node (?:/com/mitchellh/ghostty/window/)?(\d+)\s*\{", out))
+
+
+def activate(action, window=None):
+    if action == "open-window":
+        # org.freedesktop.Application.Activate is what GNOME uses on icon click: opens a window at once.
+        # (org.gtk.Actions new-window on the app object is DEFERRED by Ghostty 1.3.1: it opens much later.)
+        gdbus("call", "--session", "-d", BUS, "-o", OBJ, "-m", "org.freedesktop.Application.Activate", "{}")
+        return
+    path = f"{OBJ}/window/{window}" if window else OBJ
+    gdbus("call", "--session", "-d", BUS, "-o", path, "-m", "org.gtk.Actions.Activate", action, "[]", "{}")
+
+
+def ghostty_focused():
+    """True when a Ghostty window has keyboard focus. Window-level actions (new-tab, split-*) are
+    no-ops while no surface is focused (the window title falls back to plain "Ghostty")."""
+    wins = a11y_windows({int(x) for x in subprocess.run(["pgrep", "-x", "ghostty"], capture_output=True,
+                                                         text=True).stdout.split()}, timeout=4)
+    if wins is None:
+        return True     # no AT-SPI: assume yes and let the retry loop sort it out
+    return any(w.get("focused") for w in wins)
+
+
+def write_pending(cmd):
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PENDING_DIR / "pending.tmp"
+    tmp.write_text(cmd)
+    os.replace(tmp, PENDING)
+
+
+def ghostty_children():
+    procs = scan_procs()
+    out = set()
+    for p in procs.values():
+        if p["comm"] == "ghostty":
+            out |= {k for k in p["kids"] if k in procs and base(procs[k]["cmd"]) in ("sh", "bash")}
+    return out
+
+
+FOCUS_WAIT = int(os.environ.get("GHOSTTY_SESSION_FOCUS_WAIT", "3600"))
+
+
+def hand_over(cmd, action, window, focus_wait=None):
+    focus_wait = FOCUS_WAIT if focus_wait is None else focus_wait
+    """Write the pending command, fire the Ghostty action ONCE, wait until a new shell claimed it.
+    Ghostty queues window actions (new-tab, split-*) until that window has keyboard focus, so this
+    may wait for the user to click into the window; the pending file is re-armed every second
+    because ~/.bashrc only accepts one younger than 15 s. Returns the new surface's shell pid."""
+    before = ghostty_children()
+    write_pending(cmd)
+    activate(action, window)
+    t0, warned = time.time(), False
+    while PENDING.exists():
+        if time.time() - t0 > focus_wait:
+            PENDING.unlink(missing_ok=True)
+            raise RuntimeError(f"{action} on window {window}: not picked up in {focus_wait}s (window never focused?)")
+        if time.time() - t0 > 8 and not warned:
+            log(f"{action} on window {window}: queued by Ghostty — click into that Ghostty window to let it run")
+            warned = True
+        time.sleep(0.5)
+        if PENDING.exists():
+            write_pending(cmd)
+    time.sleep(0.6)   # let the new surface take focus before the next action
+    new = ghostty_children() - before
+    return max(new) if new else None
+
+
+def command_for(p):
+    k, cwd = p.get("kind"), p.get("cwd") or str(HOME / "workspace")
+    cd = f"cd {shlex.quote(cwd)} 2>/dev/null; "
+    if k == "claude" and p.get("id"):
+        return cd + f"claude --resume {p['id']}"
+    if k == "codex" and p.get("id"):
+        return cd + f"codex resume {p['id']}"
+    if k == "sessions":
+        return "sessions tui"
+    if k == "tmux" and p.get("id"):
+        return f"tmux attach -t {shlex.quote(p['id'])}"
+    return cd + "true"
+
+
+def running_ids():
+    ids = set()
+    for s in claude_sessions_by_pid().values():
+        if s.get("sessionId") and Path(f"/proc/{s.get('pid')}").exists():
+            ids.add(s["sessionId"])
+    procs = scan_procs()
+    for pr in procs.values():
+        if base(pr["cmd"]) == "codex":
+            for fp in fd_paths(pr["pid"]):
+                m = UUID_RE.search(os.path.basename(fp))
+                if m and "rollout-" in fp:
+                    ids.add(m.group(0))
+            for i, a in enumerate(pr["cmd"]):
+                if a == "resume" and i + 1 < len(pr["cmd"]):
+                    ids.add(pr["cmd"][i + 1])
+    return ids
+
+
+def sessions_tui_running():
+    """True when a `python3 …/sessions tui` sidebar already runs (the restore must not open a second one)."""
+    for pr in scan_procs().values():
+        if base(pr["cmd"]) in ("python3", "python") and sessions_argv(pr["cmd"]):
+            return True
+    return False
+
+
+def tmux_sessions():
+    r = subprocess.run(["tmux", "ls", "-F", "#S"], capture_output=True, text=True)
+    return set(r.stdout.split()) if r.returncode == 0 else set()
+
+
+def build_plan(snap, include_running=False):
+    """[(window_title, [(tab_title, in_place_pid|None, [(dir, program), ...]), ...]), ...] — skipping
+    claude/codex sessions that already run somewhere and tmux sessions that no longer exist."""
+    running = set() if include_running else running_ids()
+    tmuxes = tmux_sessions()
+    plan = []
+    for w in snap["windows"]:
+        tabs = []
+        for t in w["tabs"]:
+            items = []
+            for s in sorted(t["surfaces"], key=lambda s: s.get("seq", 0)):
+                p = s["program"]
+                if p.get("kind") in ("claude", "codex") and p.get("id") in running:
+                    log("skip (already running):", describe(p))
+                    continue
+                if p.get("kind") == "tmux" and p.get("id") not in tmuxes:
+                    log("skip (tmux session gone):", describe(p))
+                    continue
+                if p.get("kind") == "sessions":
+                    if sessions_tui_running():
+                        log("skip (sessions sidebar already running)")
+                        continue
+                    items.append(("left" if s.get("dir") not in ("left", "right", "down") else s["dir"], p))
+                    continue
+                items.append((s.get("dir") or "right", p))
+            if items or t.get("in_place"):
+                tabs.append((t.get("title", ""), t.get("in_place"), items))
+        if tabs:
+            plan.append((w.get("title", ""), tabs))
+    return plan
+
+
+def print_plan(plan):
+    for wi, (wt, tabs) in enumerate(plan):
+        print(f"  window {wi + 1} {strip_icon(wt)!r}")
+        for title, in_place, items in tabs:
+            print(f"    tab {strip_icon(title)!r}" + (f" (in this shell, pid {in_place})" if in_place else ""))
+            for d, p in items:
+                print(f"       {d:5s} {describe(p)}")
+
+
+def wait_window_number(before=(), timeout=120, shell_pid=None):
+    """The /window/N D-Bus object shows up seconds to a minute after the window itself."""
+    for _ in range(timeout * 2):
+        new = set(window_numbers()) - set(before)
+        if new:
+            return max(new)
+        if shell_pid and not Path(f"/proc/{shell_pid}").exists():
+            raise RuntimeError("the new window was closed before its D-Bus object appeared")
+        time.sleep(0.5)
+    return None
+
+
+def restore(path=None, window=None, new_window=False, dry=False, include_running=False):
+    """window: a D-Bus window number, "auto" (wait for one to appear and use the newest), or None.
+    The first snapshot window goes into `window` (or a new one); every further snapshot window gets
+    its own new window."""
+    snap = load_json(path or CUR, None)
+    if not snap or not snap.get("windows"):
+        print("nothing to restore in", path or CUR)
+        return 1
+    HIST.mkdir(parents=True, exist_ok=True)
+    src = HIST / time.strftime("restore-source-%Y%m%d-%H%M%S.json")
+    shutil.copy(path or CUR, src)
+    plan = build_plan(snap, include_running)
+    n = sum(len(items) for _, tabs in plan for _, _, items in tabs)
+    print(f"restoring {n} surfaces in {sum(len(t) for _, t in plan)} tabs / {len(plan)} windows "
+          f"from {snap.get('saved_at_iso')} (copy: {src})")
+    print_plan(plan)
+    if dry:
+        return 0
+    for lock_ in glob.glob(str(CODEX_LOCKS / "*.lock")):   # a crash leaves stale codex locks; codex refuses to resume
+        tid = Path(lock_).stem
+        if tid not in (set() if include_running else running_ids()):
+            Path(lock_).unlink(missing_ok=True)
+    RESTORING.write_text(str(os.getpid()))
+    opened = 0
+    try:
+        for wi, (_, tabs) in enumerate(plan):
+            win = window if wi == 0 else None
+            if win == "auto":
+                win = wait_window_number()
+                if not win:
+                    raise RuntimeError("no Ghostty window on D-Bus after 120 s")
+                log(f"restoring into D-Bus window {win}")
+            reg_win = None
+            for ti, (title, in_place, items) in enumerate(tabs):
+                if ti == 0 and in_place:
+                    # the tab already exists (the fresh shell that called cold-start); only its splits are missing
+                    reg_win = register(in_place, None, "tab", None, new_window=True)
+                    rest = items
+                elif ti == 0 and (new_window or not win):
+                    first_dir, first = items[0]
+                    before = set(window_numbers())
+                    pid = hand_over(command_for(first), "open-window", None)
+                    reg_win = register(pid, None, "tab", None, new_window=True)
+                    win = wait_window_number(before, shell_pid=pid)
+                    if not win:
+                        raise RuntimeError("new window opened but its D-Bus object never appeared; "
+                                           "re-run with --window N once `gdbus introspect` lists it")
+                    log(f"new window opened (D-Bus window {win})")
+                    opened += 1
+                    rest = items[1:]
+                else:
+                    first_dir, first = items[0]
+                    pid = hand_over(command_for(first), "new-tab", win)
+                    reg_win = register(pid, reg_win if reg_win is not None else (win or 1) - 1, "tab", None)
+                    opened += 1
+                    rest = items[1:]
+                for d, p in rest:
+                    pid = hand_over(command_for(p), f"split-{d}", win)
+                    register(pid, reg_win, "split", d)
+                    opened += 1
+    finally:
+        RESTORING.unlink(missing_ok=True)
+    print(f"done: {opened} surfaces opened")
+    return 0
+
+
+# ----------------------------------------------------------------------------- closed windows
+def closed_entries(this_boot=False, unconsumed=True):
+    es = load_json(CLOSED, {"entries": []})["entries"]
+    if this_boot:
+        es = [e for e in es if e.get("boot_id") == boot_id()]
+    if unconsumed:
+        es = [e for e in es if not e.get("reopened_at")]
+    return es
+
+
+def mark_reopened(entries):
+    closed = load_json(CLOSED, {"entries": []})
+    keys = {(e["closed_at"], e["title"], json.dumps(e["tabs"], sort_keys=True)) for e in entries}
+    for e in closed["entries"]:
+        if (e["closed_at"], e["title"], json.dumps(e["tabs"], sort_keys=True)) in keys:
+            e["reopened_at"] = time.time()
+    write_json(CLOSED, closed)
+
+
+def list_closed():
+    es = list(reversed(closed_entries(unconsumed=False)))
+    if not es:
+        print("no closed windows recorded")
+        return 0
+    for i, e in enumerate(es, 1):
+        n = sum(len(t["surfaces"]) for t in e["tabs"])
+        flag = "  (reopened)" if e.get("reopened_at") else ("" if e.get("boot_id") == boot_id() else "  (previous boot)")
+        print(f"{i:2d}. {e['closed_at_iso']}  {strip_icon(e.get('title', '')) or '-'}: {len(e['tabs'])} tabs, {n} surfaces{flag}")
+        for t in e["tabs"]:
+            print(f"      tab {strip_icon(t.get('title', ''))!r}: " + " | ".join(describe(s["program"]) for s in t["surfaces"]))
+    return 0
+
+
+def snapshot_of(entries):
+    return {"saved_at": time.time(), "saved_at_iso": entries[-1]["closed_at_iso"] + " (closed)", "boot_id": boot_id(),
+            "windows": [{"title": e.get("title", ""), "tabs": e["tabs"]} for e in entries]}
+
+
+def reopen(index=1, batch=False, window=None, new_window=False, dry=False):
+    es = list(reversed(closed_entries(unconsumed=False)))
+    if not es or index < 1 or index > len(es):
+        print("nothing to reopen (see `ghostty-session closed`)")
+        return 1
+    chosen = [es[index - 1]]
+    if batch:
+        chosen = [e for e in es if e["batch"] == chosen[0]["batch"]]
+        chosen.reverse()
+    path = HIST / time.strftime("reopen-%Y%m%d-%H%M%S.json")
+    write_json(path, snapshot_of(chosen))
+    rc = restore(str(path), window, new_window or not window, dry)
+    if rc == 0 and not dry:
+        mark_reopened(chosen)
+    return rc
+
+
+def cold_start(shell_pid):
+    """~/.bashrc calls this from a fresh Ghostty shell when Ghostty has exactly one surface. If windows
+    of this boot were closed and not reopened, prints the command this shell should run (the first
+    surface of the last closed window) and rebuilds everything else in the background."""
+    if RESTORING.exists() and Path(f"/proc/{read(RESTORING).strip() or 'x'}").exists():
+        return 0
+    with lock():
+        save()                      # journals the closed windows if the timer has not run since
+    surfaces = live_surfaces()
+    try:
+        st = read(f"/proc/{shell_pid}/stat")
+        ppid = int(st[st.rindex(")") + 2:].split()[1])
+    except (ValueError, IndexError):
+        ppid = None
+    if len(surfaces) != 1 or surfaces[0]["pid"] not in (shell_pid, ppid):
+        return 0
+    es = closed_entries(this_boot=True)
+    if not es:
+        return 0
+    batch = [e for e in es if e["batch"] == es[-1]["batch"]]
+    mark_reopened(batch)            # consumed either way, so a later lone shell does not replay it
+    plan = build_plan(snapshot_of(batch))
+    if not plan:
+        return 0
+    wt, tabs = plan[0]
+    title, _, items = tabs[0]
+    d, first = items.pop(0)
+    # the rest goes back through restore(): first tab in place (splits only), then new tabs / windows
+    windows = []
+    for wi, (wt, tabs) in enumerate(plan):
+        tl = []
+        for ti, (title, _, its) in enumerate(tabs):
+            if not its and not (wi == 0 and ti == 0):
+                continue
+            tl.append({"title": title, "in_place": surfaces[0]["pid"] if (wi == 0 and ti == 0) else None,
+                       "surfaces": [{"dir": d_, "program": p, "seq": i} for i, (d_, p) in enumerate(its)]})
+        if tl:
+            windows.append({"title": wt, "tabs": tl})
+    path = HIST / time.strftime("reopen-%Y%m%d-%H%M%S.json")
+    write_json(path, {"saved_at": time.time(), "saved_at_iso": batch[-1]["closed_at_iso"] + " (closed)",
+                      "boot_id": boot_id(), "windows": windows})
+    if sum(len(t["surfaces"]) for w in windows for t in w["tabs"]) or len(windows) > 1:
+        logf = open(STATE / time.strftime("reopen-%Y%m%d-%H%M%S.log"), "a")
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "restore", str(path), "--window", "auto",
+                          "--include-running"], stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                         start_new_session=True)
+    print(command_for(first))
+    return 0
+
+
+def register(pid, win_index, kind, d, new_window=False):
+    """Record a surface the restore just created in registry.json (so `save` keeps the right grouping).
+    Returns the registry window index used."""
+    if pid is None:
+        return win_index
+    try:
+        with lock():
+            procs = scan_procs()
+            k = f"{pid}:{round(procs[pid]['start'], 2)}"
+            reg = load_json(REG, {})
+            if reg.get("boot_id") != boot_id() or "windows" not in reg:
+                reg = {"boot_id": boot_id(), "seq": 0, "surfaces": {}, "windows": []}
+            if k in reg["surfaces"] and kind == "tab":     # already known (cold-start's fresh shell): reuse its window
+                for i, w in enumerate(reg["windows"]):
+                    if any(t["id"] == reg["surfaces"][k]["tab"] for t in w["tabs"]):
+                        return i
+            reg["seq"] += 1
+            if new_window or win_index is None or win_index >= len(reg["windows"]):
+                reg["windows"].append({"id": f"w{reg['seq']}", "tabs": []})
+                win_index = len(reg["windows"]) - 1
+            w = reg["windows"][win_index]
+            if kind == "tab" or not w["tabs"]:
+                w["tabs"].append({"id": f"t{reg['seq']}", "title": ""})
+                reg["surfaces"][k] = {"tab": w["tabs"][-1]["id"], "kind": "tab", "dir": None, "seq": reg["seq"]}
+            else:
+                reg["surfaces"][k] = {"tab": w["tabs"][-1]["id"], "kind": "split", "dir": d, "seq": reg["seq"]}
+            write_json(REG, reg)
+    except Exception as e:
+        log("register:", e)
+    return win_index
+
+
+def on_login():
+    snap = load_json(CUR, None)
+    if not snap or not snap.get("windows"):
+        log("on-login: no snapshot, nothing to restore")
+        return 0
+    if snap.get("restored_boot") == boot_id():
+        return 0
+    if time.time() - snap.get("saved_at", 0) > 14 * 86400:
+        log("on-login: snapshot older than 14 days, not restoring automatically")
+        snap["restored_boot"] = boot_id()     # release the save-side hold on this snapshot
+        write_json(CUR, snap)
+        return 0
+    for _ in range(60):   # wait for the session bus + Ghostty's D-Bus activation to work
+        try:
+            gdbus("call", "--session", "-d", BUS, "-o", OBJ, "-m", "org.gtk.Actions.List")
+            break
+        except Exception:
+            time.sleep(2)
+    rc = restore(new_window=True)
+    snap = load_json(CUR, snap)
+    snap["restored_boot"] = boot_id()
+    write_json(CUR, snap)
+    return rc
+
+
+# ----------------------------------------------------------------------------- systemd
+UNITS = {
+    "ghostty-session-save.service": """[Unit]
+Description=ghostty-session: snapshot open Ghostty tabs/splits
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ghostty-session save
+""",
+    "ghostty-session-save.timer": """[Unit]
+Description=ghostty-session: snapshot every 20 s
+
+[Timer]
+OnStartupSec=30s
+OnUnitActiveSec=20s
+AccuracySec=2s
+
+[Install]
+WantedBy=default.target
+""",
+    "ghostty-session-restore.service": """[Unit]
+Description=ghostty-session: reopen what was open before the last crash/shutdown
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 12
+ExecStart=%h/.local/bin/ghostty-session on-login
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=graphical-session.target
+""",
+}
+
+
+def install():
+    ud = HOME / ".config/systemd/user"
+    ud.mkdir(parents=True, exist_ok=True)
+    for name, body in UNITS.items():
+        (ud / name).write_text(body)
+    subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "toolkit-accessibility", "true"])
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "ghostty-session-save.timer"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "ghostty-session-restore.service"], check=True)
+    install_keybinding()
+    print("installed: save timer (20 s) + restore at login + Super+Shift+T reopen; state in", STATE)
+    return 0
+
+
+KEY_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
+KEY_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/ghostty-reopen/"
+
+
+def install_keybinding(remove=False):
+    """GNOME custom shortcut Super+Shift+T → `ghostty-session reopen --new-window` (like a browser's
+    reopen-closed-tab). Ghostty keybinds cannot run external commands, so it lives in GNOME."""
+    cur = subprocess.run(["gsettings", "get", KEY_SCHEMA, "custom-keybindings"], capture_output=True, text=True).stdout
+    paths = [x for x in re.findall(r"'([^']+)'", cur) if x != KEY_PATH]
+    if not remove:
+        paths.append(KEY_PATH)
+        sub = f"{KEY_SCHEMA}.custom-keybinding:{KEY_PATH}"
+        for k, v in (("name", "Ghostty: reopen last closed window"),
+                     ("command", f"{HOME}/.local/bin/ghostty-session reopen --new-window"),
+                     ("binding", "<Super><Shift>t")):
+            subprocess.run(["gsettings", "set", sub, k, v], check=True)
+    subprocess.run(["gsettings", "set", KEY_SCHEMA, "custom-keybindings",
+                    "[" + ", ".join(f"'{x}'" for x in paths) + "]"], check=True)
+
+
+def uninstall():
+    install_keybinding(remove=True)
+    subprocess.run(["systemctl", "--user", "disable", "--now", "ghostty-session-save.timer"])
+    subprocess.run(["systemctl", "--user", "disable", "ghostty-session-restore.service"])
+    for name in UNITS:
+        (HOME / ".config/systemd/user" / name).unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"])
+    print("removed units; snapshots kept in", STATE)
+    return 0
+
+
+def main(argv):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # progress lines must survive a kill when piped/logged
+    except Exception:
+        pass
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if any(a in ("-h", "--help") for a in rest):
+        print(__doc__)
+        return 0
+    if cmd == "save":
+        if rest:
+            print("save takes no arguments", file=sys.stderr)
+            return 2
+        with lock():
+            snap = save()
+        print(f"saved: {sum(len(t['surfaces']) for w in snap['windows'] for t in w['tabs'])} surfaces, "
+              f"{sum(len(w['tabs']) for w in snap['windows'])} tabs, a11y={'yes' if snap['a11y'] else 'no'}")
+        return 0
+    if cmd == "show":
+        return show(rest[0] if rest else None)
+    if cmd == "restore":
+        path, win, newwin, dry, incl = None, None, False, False, False
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--window":
+                win = rest[i + 1] if rest[i + 1] == "auto" else int(rest[i + 1]); i += 1
+            elif a == "--new-window":
+                newwin = True
+            elif a == "--dry-run":
+                dry = True
+            elif a == "--include-running":
+                incl = True
+            else:
+                path = a
+            i += 1
+        return restore(path, win, newwin, dry, incl)
+    if cmd == "on-login":
+        return on_login()
+    if cmd == "closed":
+        return list_closed()
+    if cmd == "cold-start":
+        return cold_start(int(rest[0]) if rest else os.getppid())
+    if cmd == "reopen":
+        index, batch, win, newwin, dry = 1, False, None, False, False
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--window":
+                win = rest[i + 1] if rest[i + 1] == "auto" else int(rest[i + 1]); i += 1
+            elif a == "--new-window":
+                newwin = True
+            elif a == "--batch":
+                batch = True
+            elif a == "--dry-run":
+                dry = True
+            elif a == "--list":
+                return list_closed()
+            else:
+                index = int(a)
+            i += 1
+        return reopen(index, batch, win, newwin, dry)
+    if cmd == "install":
+        return install()
+    if cmd == "uninstall":
+        return uninstall()
+    print("unknown command", cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

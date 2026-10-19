@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Fork a Codex session into a new Ghostty split (in the focused window: Codex sets no tab title).
+# Usage: codex-fork-split [session-id] [right|down]  (default: $CODEX_THREAD_ID, right)
+set -euo pipefail
+sid=${1:-${CODEX_THREAD_ID:-${CODEX_SESSION_ID:?no session id given and CODEX_THREAD_ID unset}}}
+exec ghostty-split-run "${2:-right}" --focused -- bash -c "cd $(printf %q "$PWD") && codex fork $sid"

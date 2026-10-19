@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fork a Claude Code session into a new Ghostty split next to it.
+# Usage: claude-fork-split [session-id] [right|down]  (default: $CLAUDE_CODE_SESSION_ID, right)
+# The split goes to the window whose title is this session's tab title (see ghostty-window-of),
+# so the session's tab must be the visible one; GHOSTTY_SPLIT_WINDOW=<n> overrides.
+set -euo pipefail
+sid=${1:-${CLAUDE_CODE_SESSION_ID:?no session id given and CLAUDE_CODE_SESSION_ID unset}}
+exec ghostty-split-run "${2:-right}" --session "$sid" -- bash -c "cd $(printf %q "$PWD") && claude -r $sid --fork-session"

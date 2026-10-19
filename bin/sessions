@@ -1,0 +1,1572 @@
+#!/usr/bin/env python3
+"""sessions — Claude Code / Codex sessions as the unit of account, drawn as a Ghostty placement tree
+(windows → tabs → splits) with live status, an intent ledger (active / parked / done) that outlives
+the tab, a backlog of sessions that have no tab, and a sweep that closes tabs of parked/stale ones.
+
+  sessions                       open the TUI in a left split of the focused Ghostty window
+  sessions tui [--once] [--width N]   the sidebar (--once: one frame to stdout, for tests)
+  sessions map [--json]          the merged model (placement + status + intent)
+  sessions log                   newest first: sid8  age  status  state  where  title
+  sessions park SID [--days N | --someday] [--note TEXT]     (skill form: --args "N note…")
+  sessions done SID
+  sessions touch SID             mark active (the tab-status hook calls this on every prompt)
+  sessions sweep [--dry-run]     close every sweepable pane (refuses on a stale snapshot)
+  sessions focus SID             prints the window + alt+N to press (no programmatic focus on GNOME)
+  sessions resume SID            new tab in the focused window running claude -r / codex resume
+  sessions install               hook line + skills + ghostty-session program kind (idempotent)
+
+Sources: ~/.local/state/ghostty-session/current.json (placement, 20 s), $XDG_RUNTIME_DIR/claude-tab-status
+(live status + titles), ~/.claude/projects/*/<sid>.jsonl (head + tail seeks only; cached by mtime),
+~/.codex/sessions (thread ids). Ledger: ~/.local/state/sessions/events.jsonl (append-only, last wins).
+Lineage: ~/.local/state/sessions/lineage.json. Cache: ~/.cache/sessions/cache.json.
+Spec: ~/fw16-setup/sessions-spec.md   Docs: ~/fw16-setup/sessions.md
+"""
+import ctypes
+import json
+import os
+import re
+import select
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+import unicodedata
+from datetime import datetime, timedelta
+from pathlib import Path
+
+HOME = Path.home()
+ENV = os.environ.get
+STATE = Path(ENV("SESSIONS_STATE_DIR") or Path(ENV("XDG_STATE_HOME", HOME / ".local/state")) / "sessions")
+CACHE_DIR = Path(ENV("SESSIONS_CACHE_DIR") or Path(ENV("XDG_CACHE_HOME", HOME / ".cache")) / "sessions")
+GHOSTTY_STATE = Path(ENV("SESSIONS_GHOSTTY_STATE") or Path(ENV("XDG_STATE_HOME", HOME / ".local/state")) / "ghostty-session")
+RUNTIME = Path(ENV("XDG_RUNTIME_DIR", "/tmp"))
+TAB_STATUS = Path(ENV("SESSIONS_TAB_STATUS_DIR") or RUNTIME / "claude-tab-status")
+CLAUDE_DIR = Path(ENV("SESSIONS_CLAUDE_DIR") or HOME / ".claude")
+CODEX_DIR = Path(ENV("SESSIONS_CODEX_DIR") or HOME / ".codex")
+CURRENT = GHOSTTY_STATE / "current.json"
+LEDGER = STATE / "events.jsonl"
+LINEAGE = STATE / "lineage.json"
+CACHE = CACHE_DIR / "cache.json"
+PENDING_DIR = RUNTIME / "ghostty-split-run"
+DECAY_DAYS = int(ENV("SESSIONS_DECAY_DAYS", "3"))          # unmarked → archived this long after last activity
+OPEN_GRACE_DAYS = float(ENV("SESSIONS_OPEN_GRACE_DAYS", "1"))   # open + unmarked + idle this long → stale
+SWEEP_COMMS = {c.strip() for c in (ENV("SESSIONS_SWEEP_COMMS") or "claude,codex").split(",") if c.strip()}
+SNAPSHOT_MAX_AGE = 60
+BACKLOG_CAP = 8
+MAX_PARK_DAYS = 3650
+BUS, OBJ = "com.mitchellh.ghostty", "/com/mitchellh/ghostty"
+ICON = {"idle": "⚪", "busy": "🚧", "done": "🟢", "ask": "🔴"}
+CODEX_SLOT = "▫ "
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+TAG_RE = re.compile(r"</?[a-zA-Z_][\w-]*(?:\s[^>]*)?>")
+ICON_RE = re.compile(r"^[\U0001F300-\U0001FAFF☀-➿⬀-⯿️\s]+")
+TITLE_MAX = 48
+DAY = 86400
+SELECTABLE = ("tab", "split", "backlog")
+
+
+def now_ts():
+    v = ENV("SESSIONS_NOW")
+    return float(v) if v else time.time()
+
+
+def boot_id():
+    return read("/proc/sys/kernel/random/boot_id").strip()
+
+
+# ----------------------------------------------------------------------------- text width
+def cw(ch):
+    if ch in ("️", "‍") or unicodedata.category(ch) == "Mn":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def width(s):
+    return sum(cw(c) for c in s)
+
+
+def fit(s, n):
+    """Cut `s` to at most n cells, with … when cut."""
+    if n <= 0:
+        return ""
+    if width(s) <= n:
+        return s
+    out, w = [], 0
+    for c in s:
+        if w + cw(c) > n - 1:
+            break
+        out.append(c)
+        w += cw(c)
+    return "".join(out).rstrip() + "…"
+
+
+def pad_line(left, right, w):
+    gap = w - width(left) - width(right)
+    if gap < 1 and right:
+        left = fit(left, max(0, w - width(right) - 1))
+        gap = w - width(left) - width(right)
+    return left + " " * max(gap, 0) + right
+
+
+def wrap_words(label, body, w, lines):
+    """`label` + body, word-wrapped into exactly `lines` lines of ≤ w cells; continuation lines are
+    indented to the label width; a cut body ends with …"""
+    indent = " " * width(label)
+    words = " ".join(body.split()).split(" ") if body.strip() else ["—"]
+    out, cur, curw, fresh = [], label, width(label), True
+    i = 0
+    while i < len(words):
+        word = words[i]
+        ww = width(word)
+        if fresh:
+            cur, curw, fresh = cur + word, curw + ww, False
+            i += 1
+        elif curw + 1 + ww <= w:
+            cur, curw = cur + " " + word, curw + 1 + ww
+            i += 1
+        else:
+            out.append(fit(cur, w))
+            if len(out) == lines:
+                break
+            cur, curw, fresh = indent, width(indent), True
+    if len(out) < lines:
+        out.append(fit(cur, w))
+    if i < len(words) or any(l.endswith("…") for l in out):
+        out[-1] = fit(out[-1].rstrip("…"), w - 1) + "…" if not out[-1].endswith("…") else out[-1]
+    while len(out) < lines:
+        out.append("")
+    return out[:lines]
+
+
+def clean(text, limit=None):
+    text = TAG_RE.sub(" ", text or "")
+    text = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", text).split())
+    return fit(text, limit) if limit else text
+
+
+def fmt_age(secs):
+    secs = max(0, int(secs))
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 2 * DAY:
+        return f"{secs // 3600}h"
+    return f"{secs // DAY}d"
+
+
+def read(p, default=""):
+    try:
+        return Path(p).read_text()
+    except OSError:
+        return default
+
+
+def load_json(p, default):
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, data):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=True))
+    os.replace(tmp, p)
+
+
+def mtime(p):
+    try:
+        return os.stat(p).st_mtime
+    except OSError:
+        return None
+
+
+# ----------------------------------------------------------------------------- ledger
+def _valid_event(ev):
+    if not isinstance(ev, dict):
+        return None
+    sid, st, ts, wake = ev.get("sid"), ev.get("state"), ev.get("ts"), ev.get("wake")
+    if not isinstance(sid, str) or not sid or st not in ("active", "parked", "done"):
+        return None
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    if wake is not None:
+        if isinstance(wake, bool) or not isinstance(wake, (int, float)):
+            return None
+        wake = int(wake)
+    return {"ts": float(ts), "sid": sid, "kind": ev.get("kind") if ev.get("kind") in ("claude", "codex") else "claude",
+            "state": st, "wake": wake, "note": ev.get("note") if isinstance(ev.get("note"), str) else "",
+            "src": ev.get("src") if isinstance(ev.get("src"), str) else ""}
+
+
+def ledger_events():
+    out = []
+    for line in read(LEDGER).split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = _valid_event(json.loads(line))
+        except ValueError:
+            ev = None
+        if ev:
+            out.append(ev)
+    return out
+
+
+def ledger_last():
+    last = {}
+    for ev in ledger_events():
+        last[ev["sid"]] = ev
+    return last
+
+
+def ledger_append(sid, state, kind="claude", wake=None, note="", src="tui"):
+    STATE.mkdir(parents=True, exist_ok=True)
+    ev = {"ts": round(now_ts(), 3), "sid": sid, "kind": kind, "state": state,
+          "wake": int(wake) if wake is not None else None, "note": note or "", "src": src}
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(ev, ensure_ascii=True) + "\n")
+    return ev
+
+
+def wake_for_days(days, now):
+    d = datetime.fromtimestamp(now).date() + timedelta(days=days)
+    return int(datetime(d.year, d.month, d.day).timestamp())
+
+
+def days_until(ts, now):
+    """Whole days from today's date to the date of ts (0 = today, negative = past)."""
+    return (datetime.fromtimestamp(ts).date() - datetime.fromtimestamp(now).date()).days
+
+
+# ----------------------------------------------------------------------------- transcripts
+def transcript_path(sid, cwd=None):
+    proj = CLAUDE_DIR / "projects"
+    if cwd:
+        p = proj / re.sub(r"[^A-Za-z0-9]", "-", cwd) / f"{sid}.jsonl"
+        if p.exists():
+            return p
+    for p in proj.glob(f"*/{sid}.jsonl"):
+        return p
+    return None
+
+
+def subagent_count(path):
+    try:
+        return len(os.listdir(Path(path).with_suffix("") / "subagents"))
+    except OSError:
+        return 0
+
+
+def _text_of(content):
+    if isinstance(content, list):
+        return " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+    return content if isinstance(content, str) else ""
+
+
+def _unescape(raw):
+    try:
+        return json.loads(f'"{raw}"')
+    except ValueError:
+        return raw
+
+
+def transcript_info(path, cache):
+    """Head + tail seeks only. Cached by (mtime, size)."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = str(path)
+    c = cache.get(key)
+    if c and c.get("mtime") == st.st_mtime and c.get("size") == st.st_size:
+        return c
+    info = {"mtime": st.st_mtime, "size": st.st_size, "title": "", "custom_title": "", "first_prompt": "",
+            "forked_from": None, "last_prompt": "", "last_assistant": "", "cwd": "", "started": st.st_mtime,
+            "summary_title": "", "subagents": subagent_count(path)}
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256 * 1024).decode("utf-8", "replace")
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 96 * 1024))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in head.split("\n"):
+        if '"type":"user"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") != "user" or rec.get("isMeta"):
+            continue
+        s = _text_of((rec.get("message") or {}).get("content")).strip()
+        if not s or s.startswith("<command-") or s.startswith("<local-command") or s.startswith("/"):
+            continue
+        if rec.get("isCompactSummary") or s.startswith("This session is being continued"):
+            m = re.search(r"^#+\s*(?:Session summary:)?\s*(.+?)\s*$", s, re.M)
+            if m and not info["summary_title"]:
+                info["summary_title"] = clean(re.sub(r"\s*[—-]+\s*continued\s*$", "", m.group(1)))
+            if not info["cwd"]:
+                info["cwd"] = rec.get("cwd") or ""
+            continue
+        info["first_prompt"] = clean(s, 400)
+        info["cwd"] = rec.get("cwd") or ""
+        ff = rec.get("forkedFrom") or {}
+        info["forked_from"] = ff.get("sessionId") if isinstance(ff, dict) else None
+        ts = rec.get("timestamp")
+        if ts:
+            try:
+                info["started"] = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+        break
+    for m in re.finditer(r'\{"type":"custom-title","customTitle":"((?:[^"\\]|\\.)*)"', head + tail):
+        info["custom_title"] = clean(_unescape(m.group(1)))
+    for m in re.finditer(r'\{"type":"ai-title","aiTitle":"((?:[^"\\]|\\.)*)"', head + tail):
+        info["title"] = clean(_unescape(m.group(1)))
+    lines = tail.split("\n")
+    if size > 96 * 1024 and lines:
+        lines = lines[1:]
+    for line in reversed(lines):
+        if not info["last_prompt"] and '"type":"last-prompt"' in line:
+            try:
+                info["last_prompt"] = clean(json.loads(line).get("lastPrompt", ""), 300)
+            except ValueError:
+                pass
+        if not info["last_assistant"] and '"type":"assistant"' in line:
+            try:
+                rec = json.loads(line)
+                t = _text_of((rec.get("message") or {}).get("content")).strip()
+                if t:
+                    info["last_assistant"] = clean(t, 300)
+            except ValueError:
+                pass
+        if info["last_prompt"] and info["last_assistant"]:
+            break
+    if not info["last_prompt"]:
+        for line in reversed(lines):
+            if '"type":"user"' in line and '"role":"user"' in line:
+                try:
+                    rec = json.loads(line)
+                    t = _text_of((rec.get("message") or {}).get("content")).strip()
+                    if t and not t.startswith("<"):
+                        info["last_prompt"] = clean(t, 300)
+                        break
+                except ValueError:
+                    pass
+    cache[key] = info
+    return info
+
+
+def recent_transcripts(since):
+    out = {}
+    for p in (CLAUDE_DIR / "projects").glob("*/*.jsonl"):
+        sid = p.stem
+        if not UUID_RE.fullmatch(sid):
+            continue
+        m = mtime(p)
+        if m is not None and m >= since:
+            out[sid] = p
+    return out
+
+
+# ----------------------------------------------------------------------------- processes
+def proc_cmdline(pid):
+    return [a for a in read(f"/proc/{pid}/cmdline").split("\0") if a]
+
+
+def proc_comm(pid):
+    return read(f"/proc/{pid}/comm").strip()
+
+
+def proc_fd0(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/fd/0")
+    except OSError:
+        return None
+
+
+def proc_start(pid):
+    try:
+        st = read(f"/proc/{pid}/stat")
+        rest = st[st.rindex(")") + 2:].split()
+        bt = 0
+        for l in read("/proc/stat").split("\n"):
+            if l.startswith("btime "):
+                bt = int(l.split()[1])
+        return bt + int(rest[19]) / os.sysconf("SC_CLK_TCK")
+    except (ValueError, IndexError, OSError):
+        return None
+
+
+def children_of(pid):
+    out = []
+    try:
+        for t in os.listdir(f"/proc/{pid}/task"):
+            out += [int(x) for x in read(f"/proc/{pid}/task/{t}/children").split()]
+    except OSError:
+        pass
+    return out
+
+
+def argv_parent(pid):
+    """Parent session of a `claude -r PARENT --fork-session` process, from its argv."""
+    args = " ".join(proc_cmdline(pid))
+    if "--fork-session" not in args:
+        return None
+    m = re.search(r"(?:^|\s)(?:-r|--resume)\s+(" + UUID_RE.pattern + r")(?:\s|$)", args)
+    return m.group(1) if m else None
+
+
+def codex_thread_id(pid):
+    """fd (open rollout / lock file) or argv only."""
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            fp = os.readlink(f"/proc/{pid}/fd/{fd}")
+            m = UUID_RE.search(os.path.basename(fp))
+            if m and ("rollout-" in fp or "thread-writer-locks" in fp):
+                return m.group(0)
+    except OSError:
+        pass
+    argv = proc_cmdline(pid)
+    for i, a in enumerate(argv):
+        if a == "resume" and i + 1 < len(argv) and UUID_RE.fullmatch(argv[i + 1]):
+            return argv[i + 1]
+    return None
+
+
+def codex_info(tid):
+    for p in (CODEX_DIR / "sessions").glob(f"*/*/*/rollout-*{tid}.jsonl"):
+        try:
+            with open(p, "rb") as f:
+                meta = json.loads(f.readline())
+            return {"mtime": mtime(p) or 0, "cwd": (meta.get("payload") or {}).get("cwd", ""), "path": str(p)}
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+# ----------------------------------------------------------------------------- live status
+def live_status(sid):
+    """(state, since) from the tab-status hook; fallback: Claude Code's own session file."""
+    p = TAB_STATUS / f"{sid}.state"
+    st = read(p).strip()
+    if st in ICON:
+        return st, mtime(p)
+    for f in (CLAUDE_DIR / "sessions").glob("*.json"):
+        s = load_json(f, {})
+        if isinstance(s, dict) and s.get("sessionId") == sid:
+            st = {"busy": "busy", "idle": "idle"}.get(s.get("status"), "idle")
+            return st, ((s.get("statusUpdatedAt") or 0) / 1000) or None
+    return "idle", None
+
+
+def hook_title(sid):
+    return read(TAB_STATUS / f"{sid}.title").strip()
+
+
+# ----------------------------------------------------------------------------- model
+def snapshot_fresh(snap, now):
+    try:
+        return snap.get("boot_id") == boot_id() and 0 <= now - float(snap.get("saved_at", 0)) <= SNAPSHOT_MAX_AGE
+    except (TypeError, ValueError):
+        return False
+
+
+def build_model(now=None):
+    now = now_ts() if now is None else now
+    cache = load_json(CACHE, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    cache_before = json.dumps(cache, sort_keys=True)
+    snap = load_json(CURRENT, {"windows": []})
+    if not isinstance(snap, dict):
+        snap = {"windows": []}
+    lineage = load_json(LINEAGE, {})
+    if not isinstance(lineage, dict):
+        lineage = {}
+    lineage_before = dict(lineage)
+    last = ledger_last()
+    sessions, windows = {}, []
+
+    def session(sid, kind):
+        if sid not in sessions:
+            sessions[sid] = {"sid": sid, "kind": kind, "title": "", "status": None, "status_since": None,
+                             "placements": [], "mtime": 0, "info": None, "proc_start": None, "argv_parent": None}
+        return sessions[sid]
+
+    for wi, w in enumerate(snap.get("windows") or [], 1):
+        win = {"n": wi, "title": ICON_RE.sub("", str(w.get("title") or "")).strip() or f"window {wi}",
+               "focused": bool(w.get("focused")), "tabs": []}
+        for ti, t in enumerate(w.get("tabs") or [], 1):
+            tab = {"n": ti, "active": bool(t.get("active")), "surfaces": []}
+            for s in sorted(t.get("surfaces") or [], key=lambda s: s.get("seq", 0)):
+                p = s.get("program") or {}
+                kind, sid, ppid = p.get("kind"), p.get("id"), p.get("pid")
+                if kind not in ("claude", "codex"):
+                    continue
+                alive = bool(ppid) and os.path.exists(f"/proc/{ppid}")
+                if kind == "codex" and not sid and alive:
+                    sid = codex_thread_id(ppid)
+                surf = {"kind": kind, "sid": sid, "pid": s.get("pid"), "prog_pid": ppid, "tty": s.get("tty"),
+                        "cwd": p.get("cwd"), "label": p.get("label"), "dir": s.get("dir"), "win": wi, "tab": ti}
+                tab["surfaces"].append(surf)
+                if sid:
+                    rec = session(sid, kind)
+                    rec["placements"].append((wi, ti, len(tab["surfaces"]) - 1))
+                    if p.get("label") and not rec["title"]:
+                        rec["title"] = clean(ICON_RE.sub("", p["label"]))
+                    if alive:
+                        rec["proc_start"] = proc_start(ppid)
+                        if kind == "claude":
+                            par = argv_parent(ppid)
+                            if par and par != sid:
+                                rec["argv_parent"] = par
+                                lineage.setdefault(sid, par)
+            if tab["surfaces"]:
+                win["tabs"].append(tab)
+        windows.append(win)
+
+    for sid, ev in last.items():
+        if ev["state"] == "done" and sid not in sessions:
+            continue          # done + closed: only shown with D (added below)
+        session(sid, ev["kind"])
+    for sid in recent_transcripts(now - DECAY_DAYS * DAY):
+        session(sid, "claude")
+    done_closed = {sid: ev for sid, ev in last.items() if ev["state"] == "done" and sid not in sessions}
+
+    def finish(rec, ev):
+        rec["open"] = bool(rec["placements"])
+        rec["note"] = ev["note"] if ev else ""
+        rec["wake"] = ev["wake"] if ev else None
+        rec["marked"] = ev["state"] if ev else None
+        st_m = mtime(TAB_STATUS / f"{rec['sid']}.state") if rec["open"] else None
+        rec["last_activity"] = max(rec["mtime"] or 0, ev["ts"] if ev else 0, st_m or 0, rec.get("proc_start") or 0)
+        idle = now - rec["last_activity"] if rec["last_activity"] else 1e12
+        if ev and ev["state"] in ("parked", "done"):
+            rec["state"] = ev["state"]
+        elif rec["open"]:
+            rec["state"] = "stale" if idle >= OPEN_GRACE_DAYS * DAY else "active"
+        else:
+            rec["state"] = "unsorted"
+        rec["archive_in"] = None
+        if rec["state"] in ("stale", "unsorted"):
+            left = (rec["last_activity"] + DECAY_DAYS * DAY - now) if rec["last_activity"] else 0
+            rec["archive_in"] = -(-int(left) // DAY) if left > 0 else 0
+            if not rec["open"] and left <= 0:
+                rec["state"] = "done"           # implicit archive (no event written)
+                rec["hidden"] = True
+        rec["due"] = rec["state"] == "parked" and rec["wake"] is not None and days_until(rec["wake"], now) <= 0
+        rec["parent"] = lineage.get(rec["sid"]) or rec.get("argv_parent") or ((rec.get("info") or {}).get("forked_from"))
+
+    for sid, rec in sessions.items():
+        if rec["kind"] == "claude":
+            info = transcript_info(transcript_path(sid), cache)
+            rec["info"] = info
+            if info:
+                rec["mtime"] = info["mtime"]
+                rec["title"] = (info.get("custom_title") or hook_title(sid) or info.get("title") or rec["title"]
+                                or info.get("summary_title") or clean(info.get("first_prompt", ""), TITLE_MAX))
+            else:
+                rec["title"] = rec["title"] or hook_title(sid) or sid[:8]
+            st, since = live_status(sid) if rec["placements"] else (None, None)
+            rec["status"], rec["status_since"] = st, since
+        else:
+            ci = codex_info(sid)
+            rec["info"] = ci
+            rec["mtime"] = ci["mtime"] if ci else 0
+            rec["title"] = rec["title"] or f"codex {sid[:8]}"
+        finish(rec, last.get(sid))
+
+    for sid, ev in done_closed.items():
+        rec = {"sid": sid, "kind": ev["kind"], "title": "", "status": None, "status_since": None, "placements": [],
+               "mtime": 0, "info": None, "proc_start": None, "argv_parent": None, "hidden": True}
+        info = transcript_info(transcript_path(sid), cache)
+        if info:
+            rec["info"], rec["mtime"] = info, info["mtime"]
+            rec["title"] = info.get("custom_title") or info.get("title") or info.get("summary_title") or clean(info.get("first_prompt", ""), TITLE_MAX)
+        rec["title"] = rec["title"] or sid[:8]
+        finish(rec, ev)
+        sessions[sid] = rec
+
+    if json.dumps(cache, sort_keys=True) != cache_before:
+        try:
+            write_json(CACHE, cache)
+        except OSError:
+            pass
+    if lineage != lineage_before:
+        try:
+            write_json(LINEAGE, lineage)
+        except OSError:
+            pass
+    return {"now": now, "windows": windows, "sessions": sessions, "fresh": snapshot_fresh(snap, now),
+            "focused_window": next((w["n"] for w in windows if w["focused"]), None)}
+
+
+def sweepable(rec):
+    return rec is not None and rec["open"] and rec["state"] in ("parked", "done", "stale")
+
+
+# ----------------------------------------------------------------------------- rows
+def right_text(rec, now, in_tree):
+    if rec is None:
+        return "—"
+    st = rec["state"]
+    if in_tree:
+        if st == "active":
+            if rec["status"] in ("done", "ask") and rec["status_since"]:
+                return fmt_age(now - rec["status_since"])
+            return ""
+        if st == "parked":
+            d = days_until(rec["wake"], now) if rec["wake"] else None
+            return "🧹" if d is None else f"🧹 {max(d, 0)}d"
+        if st == "stale":
+            return f"🧹 ?{rec['archive_in']}d"
+        if st == "done":
+            return "🧹"
+        return ""
+    if st == "parked":
+        d = days_until(rec["wake"], now) if rec["wake"] else None
+        return "" if d is None else f"{max(d, 0)}d"
+    if st == "unsorted":
+        return f"?{rec['archive_in']}d"
+    return ""
+
+
+def status_slot(rec, surf_kind=None, backlog=False):
+    if backlog:
+        return "🟢" if rec and rec.get("due") else "  "
+    if surf_kind == "codex" or (rec and rec["kind"] == "codex"):
+        return CODEX_SLOT
+    return ICON.get((rec or {}).get("status") or "idle", "⚪")
+
+
+def build_rows(model, show_done=False, expand=False, filt=""):
+    now, S = model["now"], model["sessions"]
+    f = filt.lower()
+    rows = []
+    for w in model["windows"]:
+        rows.append({"kind": "window", "n": w["n"], "sid": None})
+        tabs = w["tabs"]
+        for i, t in enumerate(tabs):
+            last_tab = i == len(tabs) - 1
+            surfs = t["surfaces"]
+            titles = []
+            for s in surfs:
+                rec = S.get(s["sid"]) if s["sid"] else None
+                titles.append(rec["title"] if rec else (s["label"] or ("codex" if s["kind"] == "codex" else "?")))
+            matches = [not f or f in ti.lower() for ti in titles]
+            if f and not any(matches):
+                continue
+            seen = []
+            for j, s in enumerate(surfs):
+                if j > 0 and not matches[j]:
+                    seen.append(s["sid"])
+                    continue
+                rec = S.get(s["sid"]) if s["sid"] else None
+                forked = bool(rec and rec.get("parent") and rec["parent"] in seen)
+                if j == 0:
+                    tree = ("└" if last_tab else "├") + str(t["n"])
+                else:
+                    last_split = all(not matches[k] for k in range(j + 1, len(surfs)))
+                    tree = (" " if last_tab else "│") + " " + ("└" if last_split else "├") + ("⑂" if forked else "─")
+                rows.append({"kind": "tab" if j == 0 else "split", "tree": tree, "slot": status_slot(rec, s["kind"]),
+                             "title": titles[j], "right": right_text(rec, now, True), "sid": s["sid"], "surf": s,
+                             "rec": rec, "sweep": sweepable(rec), "win": w["n"], "tab": t["n"], "last_tab": last_tab,
+                             "win_title": w["title"]})
+                seen.append(s["sid"])
+    rows.append({"kind": "rule", "sid": None})
+    back = [r for r in S.values() if not r["open"] and (r["state"] in ("parked", "unsorted") or (show_done and r["state"] == "done"))]
+    if f:
+        back = [r for r in back if f in r["title"].lower()]
+
+    def order(r):
+        if r["state"] == "parked" and r["due"]:
+            return (0, r["wake"], -r["last_activity"], r["title"])
+        if r["state"] == "parked" and r["wake"]:
+            return (1, r["wake"], -r["last_activity"], r["title"])
+        if r["state"] == "unsorted":
+            return (2, -r["last_activity"], 0, r["title"])
+        if r["state"] == "parked":
+            return (3, -r["last_activity"], 0, r["title"])
+        return (4, -r["last_activity"], 0, r["title"])
+    back.sort(key=order)
+    live_rows = [r for r in back if r["state"] != "done"]
+    done_rows = [r for r in back if r["state"] == "done"]        # only present with D; never capped
+    shown = (live_rows if expand else live_rows[:BACKLOG_CAP]) + done_rows
+    for r in shown:
+        rows.append({"kind": "backlog", "slot": status_slot(r, backlog=True), "title": r["title"],
+                     "right": right_text(r, now, False), "sid": r["sid"], "rec": r, "surf": None, "sweep": False})
+    rows.append({"kind": "more", "n": len(live_rows) - min(len(live_rows), len(shown) - len(done_rows)), "sid": None})
+    return rows
+
+
+def render_row(row, w, cursor=False):
+    g = "▶" if cursor else " "
+    k = row["kind"]
+    if k == "window":
+        head = f"══ {row['n']} "
+        return head + "═" * max(0, w - width(head))
+    if k == "rule":
+        return "─" * w
+    if k == "more":
+        tail = f"+{row['n']}" if row["n"] > 0 else ""
+        return "─" * max(0, w - width(tail)) + tail
+    left = f"{g}{row['tree']} {row['slot']} " if k in ("tab", "split") else f"{g}   {row['slot']} "
+    avail = w - width(left) - (width(row["right"]) + 1 if row["right"] else 0)
+    left += fit(row["title"], max(0, avail))
+    return pad_line(left, row["right"], w)
+
+
+def sweep_count(rows):
+    return sum(1 for r in rows if r.get("sweep"))
+
+
+def render(model, rows, w=56, cursor=None, footer_msg=None, detail=None, height=None):
+    w = max(40, w)
+    lines = [render_row(r, w, cursor is not None and i == cursor) for i, r in enumerate(rows)]
+    default_footer = f" s 🧹 {sweep_count(rows)}" if model.get("fresh", True) else " snapshot stale"
+    footer = pad_line(footer_msg if footer_msg is not None else default_footer, "?", w)
+    body = lines
+    if height:
+        avail = max(0, height - 1 - (len(detail) if detail else 0))
+        if cursor is not None and len(body) > avail:
+            top = max(0, min(cursor - avail // 2, len(body) - avail))
+            body = body[top:top + avail]
+        else:
+            body = body[:avail]
+        body = body + [""] * (avail - len(body))
+    return body + (detail or []) + [footer]
+
+
+def detail_lines(rec, model, w):
+    """7 rows: rule, title·state, meta/note, you ×2, claude ×2."""
+    w = max(40, w)
+    if not rec:
+        return ["═" * w, " (no session id)", "", "", "", "", ""]
+    now, st = model["now"], rec["state"]
+    if st == "parked":
+        d = days_until(rec["wake"], now) if rec["wake"] else None
+        when = f"wake {d}d" if d is not None else "wake —"
+    elif st in ("stale", "unsorted"):
+        when = f"archive ?{rec['archive_in']}d"
+    else:
+        when = ""
+    age = fmt_age(now - rec["last_activity"]) if rec["last_activity"] else "?"
+    right = f"{st} {age}" + (f" · {when}" if when else "")
+    l1 = pad_line(fit(f" {rec['title']}", max(0, w - width(right) - 2)), right, w)
+    info = rec.get("info") or {}
+    if rec.get("note"):
+        l2 = fit(f" note   {rec['note']}", w)
+    else:
+        parent = model["sessions"].get(rec.get("parent")) if rec.get("parent") else None
+        lead = f"fork of {parent['title']}" if parent else (f"fork of {rec['parent'][:8]}" if rec.get("parent") else f"subagents {info.get('subagents', 0)}")
+        cwd = (info.get("cwd") or "").replace(str(HOME), "~")
+        l2 = fit(f" {lead} · {rec['sid'][:8]}" + (f" · {cwd}" if cwd else ""), w)
+    you = wrap_words("you    ", info.get("last_prompt") or "—", w - 1, 2)
+    cl = wrap_words("claude ", info.get("last_assistant") or "—", w - 1, 2)
+    return ["═" * w, l1, l2] + [" " + l for l in you] + [" " + l for l in cl]
+
+
+# ----------------------------------------------------------------------------- actions (ghostty)
+def focused_dbus_window():
+    try:
+        r = subprocess.run([str(HOME / ".local/bin/ghostty-window-of"), "--focused"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    s = r.stdout.strip()
+    return int(s) if s.isdigit() else None
+
+
+def resume_command(rec):
+    cwd = ((rec.get("info") or {}).get("cwd")) or str(HOME / "workspace")
+    cd = f"cd {shlex.quote(cwd)} 2>/dev/null; "
+    if rec["kind"] == "codex":
+        return cd + f"codex resume {rec['sid']}"
+    return cd + f"claude -r {rec['sid']}"
+
+
+def new_tab_with(cmd):
+    """Open a new tab in the focused Ghostty window and run cmd there (ghostty-split-run's pending hand-over)."""
+    win = focused_dbus_window()
+    if win is None:
+        return False, "no focused Ghostty window"
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PENDING_DIR / "pending.tmp"
+    tmp.write_text(cmd)
+    os.replace(tmp, PENDING_DIR / "pending")
+    subprocess.run(["gdbus", "call", "--session", "-d", BUS, "-o", f"{OBJ}/window/{win}", "-m",
+                    "org.gtk.Actions.Activate", "new-tab", "[]", "{}"], capture_output=True, timeout=20)
+    for _ in range(24):
+        if not (PENDING_DIR / "pending").exists():
+            return True, f"new tab in window {win}"
+        time.sleep(0.25)
+    try:
+        (PENDING_DIR / "pending").unlink()
+    except OSError:
+        pass
+    return False, "no new shell picked the command up within 6 s"
+
+
+def do_resume(rec):
+    ok, msg = new_tab_with(resume_command(rec))
+    if ok:
+        ledger_append(rec["sid"], "active", rec["kind"], src="tui")
+    return ok, msg
+
+
+def focus_hint(row):
+    n, title = row["tab"], row.get("win_title") or f"window {row['win']}"
+    if n <= 8:
+        key = f"alt+{n}"
+    elif n == 9 and row.get("last_tab"):
+        key = "alt+9 = last tab"
+    else:
+        key = f"tab {n}"
+    return f'→ "{title}" · {key}'
+
+
+def check_target(surf):
+    """(prog_pid, [shell pids]) when the pane's program and its bash are what the snapshot says, else None."""
+    prog, wrapper, tty_ = surf.get("prog_pid"), surf.get("pid"), surf.get("tty")
+    if not prog or not wrapper or not tty_:
+        return None
+    if proc_comm(prog) not in SWEEP_COMMS or proc_fd0(prog) != tty_:
+        return None
+    shells = [c for c in children_of(wrapper) if proc_fd0(c) == tty_]
+    if not shells:
+        return None
+    return prog, shells
+
+
+def sweep(model, rows=None, dry=False):
+    """Close every sweepable pane (of `rows` when given). Returns (results, error)."""
+    if not model.get("fresh", False) or not snapshot_fresh(load_json(CURRENT, {}), now_ts()):
+        return [], "snapshot stale"          # re-read at kill time: the TUI model can be minutes old
+    targets = []
+    if rows is not None:
+        for r in rows:
+            if r.get("sweep"):
+                targets.append((f"{r['win']}.{r['tab']} {r['title']}", r["surf"]))
+    else:
+        for w in model["windows"]:
+            for t in w["tabs"]:
+                for s in t["surfaces"]:
+                    rec = model["sessions"].get(s["sid"]) if s["sid"] else None
+                    if sweepable(rec):
+                        targets.append((f"{w['n']}.{t['n']} {rec['title']}", s))
+    results, live = [], []
+    for label, surf in targets:
+        chk = check_target(surf)
+        if not chk:
+            results.append((label, ["skipped: identity check failed"]))
+            continue
+        prog, shells = chk
+        results.append((label, [f"TERM {prog}"] + [f"HUP {s}" for s in shells]))
+        live.append((prog, shells))
+    if dry or not live:
+        return results, None
+    for prog, _ in live:
+        try:
+            os.kill(prog, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 3.0
+    while time.time() < deadline and any(os.path.exists(f"/proc/{p}") for p, _ in live):
+        time.sleep(0.1)
+    for prog, _ in live:
+        if os.path.exists(f"/proc/{prog}"):
+            try:
+                os.kill(prog, signal.SIGKILL)
+            except OSError:
+                pass
+    for _, shells in live:
+        for sh in shells:
+            try:
+                os.kill(sh, signal.SIGHUP)
+            except OSError:
+                pass
+    return results, None
+
+
+# ----------------------------------------------------------------------------- inotify (stdlib via ctypes)
+class Watcher:
+    IN_MODIFY, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x2, 0x8, 0x80, 0x100, 0x200
+
+    def __init__(self, dirs):
+        """dirs: {path: set(names) | callable(name) -> bool}"""
+        self.fd, self.wds = None, {}
+        try:
+            self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            fd = self.libc.inotify_init1(0o4000)   # IN_NONBLOCK
+            if fd < 0:
+                return
+            mask = self.IN_MODIFY | self.IN_CLOSE_WRITE | self.IN_MOVED_TO | self.IN_CREATE | self.IN_DELETE
+            for d, accept in dirs.items():
+                Path(d).mkdir(parents=True, exist_ok=True)
+                wd = self.libc.inotify_add_watch(fd, str(d).encode(), mask)
+                if wd >= 0:
+                    self.wds[wd] = accept
+            self.fd = fd
+        except Exception:
+            self.fd = None
+
+    def drain(self):
+        """True when an accepted name changed."""
+        if self.fd is None:
+            return False
+        hit = False
+        try:
+            while True:
+                buf = os.read(self.fd, 65536)
+                i = 0
+                while i + 16 <= len(buf):
+                    wd, mask, cookie, ln = struct.unpack_from("iIII", buf, i)
+                    name = buf[i + 16:i + 16 + ln].split(b"\0", 1)[0].decode("utf-8", "replace")
+                    i += 16 + ln
+                    accept = self.wds.get(wd)
+                    if accept is None:
+                        continue
+                    if (accept(name) if callable(accept) else name in accept):
+                        hit = True
+        except (BlockingIOError, OSError):
+            pass
+        return hit
+
+
+# ----------------------------------------------------------------------------- TUI
+def term_size():
+    try:
+        c, r = os.get_terminal_size()
+        if r > 0 and c > 0:
+            return r, c
+    except OSError:
+        pass
+    return 49, 56
+
+
+HELP = [
+    "═══ keys ═══",
+    " j/k ↑↓  move        ↵  focus hint / resume",
+    " r  resume (closed)   p  park: days or s, note",
+    " x  done     a  activate     s  sweep 🧹 panes",
+    " /  filter   Esc clear   space  detail pane",
+    " D  show done   m  whole backlog   q  quit",
+    "",
+    " ══ N  window   ├N tab (alt+N)   ├─ split   └⑂ fork",
+    " ⚪🚧🟢🔴 live  ▫ codex   right: wait age | Nd wake",
+    " ?Nd archive countdown   🧹 = s closes this pane",
+]
+
+
+def tui(width_opt=None):
+    fd = sys.stdin.fileno()
+    out = sys.stdout
+    old = termios.tcgetattr(fd)
+    pipe_r, pipe_w = os.pipe()
+    os.set_blocking(pipe_w, False)
+    os.set_blocking(pipe_r, False)
+
+    def on_term(*_):
+        raise SystemExit(143)
+
+    def on_winch(*_):
+        try:
+            os.write(pipe_w, b"w")
+        except OSError:
+            pass
+    old_term, old_winch = signal.signal(signal.SIGTERM, on_term), signal.signal(signal.SIGWINCH, on_winch)
+    watcher = None
+    try:
+        tty.setraw(fd)
+        out.write("\033[?1049h\033[?25l\033]2;sessions\007")
+        out.flush()
+        watcher = Watcher({GHOSTTY_STATE: {"current.json"}, STATE: {"events.jsonl", "lineage.json"},
+                           TAB_STATUS: lambda n: n.endswith(".state")})
+        state = {"cursor": 0, "show_done": False, "expand": False, "filt": "", "msg": None, "msg_until": 0,
+                 "detail": False, "help": False, "mode": None, "buf": "", "park_days": None, "sel": None}
+        model = build_model()
+        rows = build_rows(model, state["show_done"], state["expand"], state["filt"])
+        last_build, dirty_at = time.time(), None
+
+        def selectable_idx(rows_):
+            return [i for i, r in enumerate(rows_) if r["kind"] in SELECTABLE]
+
+        def clamp():
+            idx = selectable_idx(rows)
+            if not idx:
+                state["cursor"] = 0
+                return
+            if state["cursor"] not in idx:
+                state["cursor"] = min(idx, key=lambda i: abs(i - state["cursor"]))
+
+        def move(delta):
+            idx = selectable_idx(rows)
+            if not idx:
+                return
+            if state["cursor"] not in idx:
+                clamp()
+                return
+            k = idx.index(state["cursor"]) + delta
+            state["cursor"] = idx[max(0, min(len(idx) - 1, k))]
+
+        def rebuild():
+            nonlocal model, rows, last_build
+            model = build_model()
+            rows = build_rows(model, state["show_done"], state["expand"], state["filt"])
+            last_build = time.time()
+            if state["sel"]:
+                for i, rw in enumerate(rows):
+                    if rw.get("sid") == state["sel"] and rw["kind"] in SELECTABLE:
+                        state["cursor"] = i
+                        break
+            clamp()
+
+        def rerows():
+            nonlocal rows
+            rows = build_rows(model, state["show_done"], state["expand"], state["filt"])
+            clamp()
+
+        def say(text, secs=3):
+            state["msg"], state["msg_until"] = text, time.time() + secs
+
+        def draw():
+            rows_, cols = term_size()
+            w = max(40, width_opt or cols)
+            clamp()
+            cur = rows[state["cursor"]] if rows else None
+            det = None
+            if state["detail"] and rows_ >= 15 and cur and cur.get("sid"):
+                det = detail_lines(model["sessions"].get(cur["sid"]), model, w)
+            m = state["mode"]
+            foot = None
+            if state["msg"] and time.time() < state["msg_until"]:
+                foot = f" {state['msg']}"
+            elif m == "filter":
+                foot = f" /{state['buf']}"
+            elif m == "days":
+                foot = f" park: days [1] or s {state['buf']}"
+            elif m == "note":
+                foot = f" note: {state['buf']}"
+            elif m == "confirm":
+                foot = f" {state['buf']} y/n"
+            if state["help"]:
+                lines = ([fit(h, w) for h in HELP] + [""] * rows_)[:rows_]
+            else:
+                lines = render(model, rows, w, state["cursor"], foot, det, rows_)
+            out.write("\033[H")
+            for i, l in enumerate(lines):
+                out.write("\033[2K" + l + ("\r\n" if i < len(lines) - 1 else ""))
+            out.write("\033[J")
+            out.flush()
+
+        clamp()
+        draw()
+        def handle(ch):
+            if ch == "\x1b[A":
+                ch = "k"
+            elif ch == "\x1b[B":
+                ch = "j"
+            cur = rows[state["cursor"]] if rows else None
+            rec = model["sessions"].get(cur["sid"]) if cur and cur.get("sid") else None
+            if state["mode"]:
+                m = state["mode"]
+                if ch in ("\x1b", "\x03"):
+                    state["mode"], state["buf"] = None, ""
+                elif ch in ("\x7f", "\b"):
+                    state["buf"] = state["buf"][:-1]
+                elif ch in ("\r", "\n"):
+                    b = state["buf"].strip()
+                    if m == "filter":
+                        state["filt"], state["mode"], state["buf"] = b, None, ""
+                        rerows()
+                    elif m == "days":
+                        if b == "" or b.isdigit():
+                            state["park_days"] = min(int(b or 1), MAX_PARK_DAYS)
+                            state["mode"], state["buf"] = "note", ""
+                        elif b in ("s", "someday"):
+                            state["park_days"] = None
+                            state["mode"], state["buf"] = "note", ""
+                        else:
+                            state["buf"] = ""
+                            say("days: number or s", 1.5)
+                    elif m == "note":
+                        if rec:
+                            d = state["park_days"]
+                            wake = wake_for_days(d, now_ts()) if d is not None else None
+                            ledger_append(rec["sid"], "parked", rec["kind"], wake, b, "tui")
+                            say(f"parked {'someday' if wake is None else str(d) + 'd'}: {rec['title']}")
+                        state["mode"], state["buf"] = None, ""
+                        rebuild()
+                    elif m == "confirm":
+                        state["mode"], state["buf"] = None, ""
+                elif m == "confirm":
+                    if ch in ("y", "Y"):
+                        res, err = sweep(model, rows)
+                        say(err or f"swept {sum(1 for _, s in res if s and not s[0].startswith('skipped'))} of {len(res)}")
+                        rebuild()
+                    state["mode"], state["buf"] = None, ""
+                elif ch.isprintable():
+                    state["buf"] += ch
+                draw()
+                return True
+            if state["help"]:
+                state["help"] = False
+                draw()
+                return True
+            if ch in ("q", "\x03"):
+                return False
+            elif ch == "j":
+                move(1)
+            elif ch == "k":
+                move(-1)
+            elif ch == "?":
+                state["help"] = True
+            elif ch == " ":
+                state["detail"] = not state["detail"]
+            elif ch == "D":
+                state["show_done"] = not state["show_done"]
+                rerows()
+            elif ch == "m":
+                state["expand"] = not state["expand"]
+                rerows()
+            elif ch == "/":
+                state["mode"], state["buf"] = "filter", ""
+            elif ch == "\x1b":
+                state["filt"] = ""
+                rerows()
+            elif ch in ("\r", "\n", "r"):
+                if rec and rec["open"]:
+                    say(focus_hint(cur), 4)
+                elif rec:
+                    say("resuming…", 8)
+                    draw()
+                    ok, msg = do_resume(rec)
+                    say(("✓ " if ok else "✗ ") + msg)
+                    rebuild()
+            elif ch == "p" and rec:
+                state["mode"], state["buf"], state["park_days"] = "days", "", None
+            elif ch == "x" and rec:
+                ledger_append(rec["sid"], "done", rec["kind"], src="tui")
+                say(f"done: {rec['title']}")
+                rebuild()
+            elif ch == "a" and rec:
+                ledger_append(rec["sid"], "active", rec["kind"], src="tui")
+                say(f"active: {rec['title']}")
+                rebuild()
+            elif ch == "s":
+                n = sweep_count(rows)
+                if not model.get("fresh", False):
+                    say("snapshot stale: no sweep")
+                elif n == 0:
+                    say("nothing to sweep")
+                elif n > 3:
+                    state["mode"], state["buf"] = "confirm", f"sweep {n} panes?"
+                else:
+                    res, err = sweep(model, rows)
+                    say(err or f"swept {sum(1 for _, s in res if s and not s[0].startswith('skipped'))} of {len(res)}")
+                    rebuild()
+            if cur and cur.get("sid"):
+                state["sel"] = cur["sid"]
+            return True
+
+        while True:
+            fds = [fd, pipe_r] + ([watcher.fd] if watcher and watcher.fd is not None else [])
+            timeout = 2.0 if not watcher or watcher.fd is None else 30.0
+            if dirty_at is not None:
+                timeout = max(0.0, min(timeout, dirty_at + 0.5 - time.time()))
+            if state["msg"] and time.time() < state["msg_until"]:
+                timeout = min(timeout, max(0.05, state["msg_until"] - time.time()))
+            r, _, _ = select.select(fds, [], [], timeout)
+            if watcher and watcher.fd is not None and watcher.fd in r:
+                if watcher.drain():
+                    dirty_at = time.time() if dirty_at is None else dirty_at
+            if pipe_r in r:
+                try:
+                    os.read(pipe_r, 64)
+                except OSError:
+                    pass
+            if (dirty_at is not None and time.time() >= dirty_at + 0.5) or time.time() - last_build > 60:
+                dirty_at = None
+                rebuild()
+            if fd not in r:
+                draw()
+                continue
+            data = os.read(fd, 64).decode("utf-8", "replace")
+            keys, i = [], 0
+            while i < len(data):
+                if data[i] == "\x1b" and i + 1 < len(data) and data[i + 1] == "[":
+                    keys.append(data[i:i + 3]); i += 3
+                else:
+                    keys.append(data[i]); i += 1
+            stop = False
+            for key in keys:
+                if handle(key) is False:
+                    stop = True
+                    break
+            if stop:
+                break
+            draw()
+    finally:
+        try:
+            out.write("\033[?1049l\033[?25h\033]2;\007")
+            out.flush()
+        except Exception:
+            pass
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGWINCH, old_winch)
+        for p in (pipe_r, pipe_w):
+            try:
+                os.close(p)
+            except OSError:
+                pass
+    return 0
+
+
+# ----------------------------------------------------------------------------- subcommands
+def cmd_once(width_opt, show_done=False, expand=False):
+    model = build_model()
+    rows = build_rows(model, show_done, expand)
+    for l in render(model, rows, width_opt or 56):
+        print(l.rstrip())
+    return 0
+
+
+def cmd_map(as_json):
+    model = build_model()
+    if as_json:
+        out = {"now": model["now"], "fresh": model["fresh"], "windows": model["windows"],
+               "sessions": {k: {kk: vv for kk, vv in v.items() if kk != "info"} | {"cwd": (v.get("info") or {}).get("cwd", "")}
+                            for k, v in model["sessions"].items()}}
+        print(json.dumps(out, ensure_ascii=False, indent=1, default=str))
+        return 0
+    print(f"snapshot {'fresh' if model['fresh'] else 'STALE'}")
+    for w in model["windows"]:
+        print(f"window {w['n']}{' *' if w['focused'] else ''}  {w['title']}")
+        for t in w["tabs"]:
+            for j, s in enumerate(t["surfaces"]):
+                rec = model["sessions"].get(s["sid"]) if s["sid"] else None
+                print(f"  {t['n']}{'.' + str(j) if j else '  '}  {s['kind']:6} {(s['sid'] or '—')[:8]:8}  "
+                      f"{(rec or {}).get('state', '—'):8} {(rec or {}).get('status') or '-':5} {(rec or {}).get('title', s['label'] or '')}")
+    back = [r for r in model["sessions"].values() if not r["open"] and r["state"] != "done"]
+    print(f"backlog ({len(back)})")
+    for r in sorted(back, key=lambda r: -r["last_activity"]):
+        print(f"  {r['kind']:6} {r['sid'][:8]}  {r['state']:8} {right_text(r, model['now'], False):5} {r['title']}  {r['note']}")
+    return 0
+
+
+def cmd_log():
+    model = build_model(now_ts())
+    for r in sorted(model["sessions"].values(), key=lambda r: -r["last_activity"]):
+        where = ",".join(f"{w}.{t}" for w, t, _ in r["placements"]) or "-"
+        print(f"{r['sid'][:8]}  {fmt_age(model['now'] - r['last_activity']) if r['last_activity'] else '?':>4}  "
+              f"{ICON.get(r['status'] or '', '  ') if r['status'] else '  '} {r['state']:8} {where:6} {r['title']}")
+    return 0
+
+
+def cmd_open():
+    r = subprocess.run([str(HOME / ".local/bin/ghostty-split-run"), "left", "--focused", "--", "sessions", "tui"])
+    return r.returncode
+
+
+def cmd_focus(sid):
+    model = build_model()
+    rec = model["sessions"].get(sid)
+    if not rec or not rec["open"]:
+        print("not open", file=sys.stderr)
+        return 1
+    w, t, _ = rec["placements"][0]
+    win = model["windows"][w - 1]
+    row = {"tab": t, "win": w, "win_title": win["title"], "last_tab": t == len(win["tabs"])}
+    print(focus_hint(row))
+    return 0
+
+
+def parse_park_args(args):
+    """CLI: [--days N | --someday] [--note TEXT] [free note words];  skill: --args "N note…" (one string)."""
+    days, note, someday = 1, "", False
+    if args and args[0] == "--args":
+        try:
+            words = shlex.split(" ".join(args[1:]))
+        except ValueError:
+            words = " ".join(args[1:]).split()
+        if words and words[0].isdigit():
+            days, words = int(words[0]), words[1:]
+        elif words and words[0] in ("someday", "s", "-"):
+            someday, words = True, words[1:]
+        note = " ".join(words)
+    else:
+        i = 0
+        while i < len(args):
+            if args[i] == "--days":
+                if i + 1 >= len(args) or not args[i + 1].isdigit():
+                    raise ValueError("--days needs a whole number")
+                days = int(args[i + 1]); i += 2
+            elif args[i] == "--someday":
+                someday = True; i += 1
+            elif args[i] == "--note":
+                note = args[i + 1] if i + 1 < len(args) else ""; i += 2
+            else:
+                note = (note + " " + args[i]).strip(); i += 1
+    if days < 0 or days > MAX_PARK_DAYS:
+        raise ValueError(f"days must be 0..{MAX_PARK_DAYS}")
+    return days, note, someday
+
+
+GS_BIN = Path(ENV("SESSIONS_GS_BIN") or HOME / ".local/bin/ghostty-session")
+
+# ghostty-session integration: (snippet, anchor) pairs — the snippet is inserted before the anchor when absent —
+# and (old → new) replacements for lines that must change. Applying them to a pristine ghostty-session or to one
+# that already has an older form of the edits gives the same result (see run_tests.py "install idempotent").
+GS_INSERTS = [
+    ('def sessions_argv(cmd):\n'
+     '    """True for `python3 [-flags…] …/sessions tui` (the sidebar), e.g. python3 -I ~/.local/bin/sessions tui."""\n'
+     '    args = list(cmd[1:])\n'
+     '    while args and args[0].startswith("-"):\n'
+     '        args = args[1:]\n'
+     '    return len(args) > 1 and os.path.basename(args[0]) == "sessions" and args[1] == "tui"\n\n\n',
+     'def classify(procs, root, csess):\n'),
+    ('        if b in ("python3", "python") and sessions_argv(pr["cmd"]):\n'
+     '            return {"kind": "sessions", "id": None, "cwd": pr["cwd"], "pid": p, "label": "sessions"}\n',
+     '        if b == "codex":\n'),
+    ('    if k == "sessions":\n        return "sessions"\n',
+     '    if k == "shell":\n        if p.get("label"):\n'),
+    ('    if k == "sessions":\n        return "sessions (sidebar)"\n',
+     '    if k == "tmux":\n        return f"tmux {p.get(\'id\') or \'?\'}"\n'),
+    ('    if k == "sessions":\n        return "sessions tui"\n',
+     '    if k == "tmux" and p.get("id"):\n'),
+    ('def sessions_tui_running():\n'
+     '    """True when a `python3 …/sessions tui` sidebar already runs (the restore must not open a second one)."""\n'
+     '    for pr in scan_procs().values():\n'
+     '        if base(pr["cmd"]) in ("python3", "python") and sessions_argv(pr["cmd"]):\n'
+     '            return True\n'
+     '    return False\n\n\n',
+     'def tmux_sessions():\n'),
+    ('                if p.get("kind") == "sessions":\n'
+     '                    if sessions_tui_running():\n'
+     '                        log("skip (sessions sidebar already running)")\n'
+     '                        continue\n'
+     '                    items.append(("left" if s.get("dir") not in ("left", "right", "down") else s["dir"], p))\n'
+     '                    continue\n',
+     '                items.append((s.get("dir") or "right", p))\n'),
+    ('    if any(a in ("-h", "--help") for a in rest):\n        print(__doc__)\n        return 0\n',
+     '    if cmd == "save":\n'),
+]
+GS_REPLACES = [
+    # split_dir: `left` only for the sidebar (kind sessions); every other pane classifies exactly as before
+    (['        if abs(b[1] - a[1]) < 8 and b[0] != a[0]:\n            return "right"\n        return "right" if b[0] > a[0] else "down"\n',
+      '        if abs(b[1] - a[1]) < 8 and b[0] != a[0]:\n            return "right" if b[0] > a[0] else "left"\n        return "right" if b[0] > a[0] else ("left" if b[0] < a[0] else "down")\n'],
+     '        if abs(b[1] - a[1]) < 8 and b[0] != a[0]:\n            return "right" if (b[0] > a[0] or not is_sidebar) else "left"\n        return "right" if b[0] > a[0] else ("left" if (b[0] < a[0] and is_sidebar) else "down")\n'),
+    (['    a = nearest_rect((prev or {}).get("size"), rects) if prev else None\n    b = nearest_rect(s.get("size"), rects)\n'],
+     '    is_sidebar = (s.get("program") or {}).get("kind") == "sessions"      # only the sidebar may be a left split\n'
+     '    a = nearest_rect((prev or {}).get("size"), rects) if prev else None\n    b = nearest_rect(s.get("size"), rects)\n'),
+    (['        if b in ("python3", "python") and len(pr["cmd"]) > 2 and os.path.basename(pr["cmd"][1]) == "sessions" and pr["cmd"][2] == "tui":\n'],
+     '        if b in ("python3", "python") and sessions_argv(pr["cmd"]):\n'),
+    (['        c = pr["cmd"]\n        if len(c) > 2 and base(c) in ("python3", "python") and os.path.basename(c[1]) == "sessions" and c[2] == "tui":\n'],
+     '        if base(pr["cmd"]) in ("python3", "python") and sessions_argv(pr["cmd"]):\n'),
+    (['arrow = {"right": "→", "down": "↓"}.get(s.get("dir")) or "•"'],
+     'arrow = {"right": "→", "down": "↓", "left": "←"}.get(s.get("dir")) or "•"'),
+    (['    if cmd == "save":\n        with lock():\n'],
+     '    if cmd == "save":\n        if rest:\n            print("save takes no arguments", file=sys.stderr)\n            return 2\n        with lock():\n'),
+]
+
+
+def install_ghostty_session():
+    g = read(GS_BIN)
+    if not g:
+        return [f"!! {GS_BIN} missing"]
+    new = g
+    for olds, repl in GS_REPLACES:
+        if repl in new:
+            continue
+        for o in olds:
+            if o in new:
+                new = new.replace(o, repl, 1)
+                break
+    for snippet, anchor in GS_INSERTS:
+        if snippet in new:
+            continue
+        if anchor not in new:
+            return [f"!! ghostty-session anchor not found: {anchor.strip().splitlines()[0]!r}; nothing written"]
+        new = new.replace(anchor, snippet + anchor, 1)
+    # the --help router must sit after `cmd, rest = …`, which the save anchor guarantees; sanity: compile
+    try:
+        compile(new, str(GS_BIN), "exec")
+    except SyntaxError as e:
+        return [f"!! ghostty-session edit would not compile ({e}); nothing written"]
+    if new == g:
+        return ["ghostty-session integration already complete"]
+    bak = GS_BIN.with_name(GS_BIN.name + f".bak-{time.strftime('%Y%m%d')}")
+    if not bak.exists():
+        bak.write_text(g)
+    GS_BIN.write_text(new)
+    return [f"ghostty-session: integration applied (backup {bak.name})"]
+
+
+def install():
+    did = []
+    hook = CLAUDE_DIR / "hooks/tab-status.py"
+    src = read(hook)
+    if src and "# sessions-touch" not in src:
+        bak = hook.with_name(hook.name + f".bak-{time.strftime('%Y%m%d')}")
+        bak.write_text(src)
+        snippet = (
+            "    if ev.get(\"hook_event_name\") == \"UserPromptSubmit\":   # sessions-touch: reactivate on every prompt\n"
+            "        try:\n"
+            "            exe = os.path.expanduser(\"~/.local/bin/sessions\")\n"
+            "            if os.path.exists(exe):\n"
+            "                subprocess.Popen([exe, \"touch\", sid_of(ev)], stdin=subprocess.DEVNULL,\n"
+            "                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
+            "        except Exception:\n"
+            "            pass\n")
+        anchor = "    write(os.path.join(STATE, sid_of(ev) + \".state\"), st)\n"
+        if anchor in src:
+            hook.write_text(src.replace(anchor, anchor + snippet, 1))
+            did.append(f"hook line added to {hook} (backup {bak.name})")
+        else:
+            did.append(f"!! could not find anchor in {hook}; hook line NOT added")
+    else:
+        did.append("hook line already present" if src else f"!! {hook} missing")
+    skills = CLAUDE_DIR / "skills"
+    park = skills / "park/SKILL.md"
+    park_text = '''---
+name: park
+description: Park this session (keep it in the sessions backlog, pick it up later). Use only when the user types /park.
+argument-hint: "[days|s] [note]"
+disable-model-invocation: true
+---
+
+Run exactly this, with no other steps first (`$ARGUMENTS` = optional day count or `s` for someday, then a note):
+
+```bash
+sessions park "$CLAUDE_CODE_SESSION_ID" --args "$ARGUMENTS"
+```
+
+Reply with one line: parked, when it wakes (N days or someday) and the note. If it fails, show the error verbatim.
+Tooling: `~/.local/bin/sessions` (docs: ~/fw16-setup/sessions.md).
+'''
+    if read(park) != park_text:
+        park.parent.mkdir(parents=True, exist_ok=True)
+        park.write_text(park_text)
+        did.append(f"wrote {park}")
+    done_ = skills / "done/SKILL.md"
+    done_text = '''---
+name: done
+description: Mark this session done in the sessions ledger (never resume it). Use only when the user types /done.
+disable-model-invocation: true
+---
+
+Run exactly this, with no other steps first (it takes no arguments):
+
+```bash
+sessions done "$CLAUDE_CODE_SESSION_ID"
+```
+
+Reply with one line: done, and that the tab can be swept from the sessions sidebar (`s`). If it fails, show the error verbatim.
+'''
+    if read(done_) != done_text:
+        done_.parent.mkdir(parents=True, exist_ok=True)
+        done_.write_text(done_text)
+        did.append(f"wrote {done_}")
+    did += install_ghostty_session()
+    STATE.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    did.append(f"state dir {STATE}, cache dir {CACHE_DIR}")
+    print("\n".join(did))
+    return 0
+
+
+def main(argv):
+    if not argv:
+        return cmd_open()
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if cmd == "open":
+        return cmd_open()
+    if cmd == "tui":
+        w = None
+        if "--width" in rest:
+            try:
+                w = int(rest[rest.index("--width") + 1])
+            except (IndexError, ValueError):
+                print("--width needs a number", file=sys.stderr)
+                return 2
+        if "--once" in rest:
+            return cmd_once(w, "--done" in rest, "--all" in rest)
+        if not sys.stdin.isatty():
+            print("tui needs a terminal (use --once for a single frame)", file=sys.stderr)
+            return 2
+        return tui(w)
+    if cmd == "map":
+        return cmd_map("--json" in rest)
+    if cmd == "log":
+        return cmd_log()
+    if cmd in ("park", "done", "touch", "focus", "resume"):
+        if not rest or not rest[0]:
+            print(f"usage: sessions {cmd} SID ...", file=sys.stderr)
+            return 2
+        sid = rest[0]
+        is_codex = bool(list((CODEX_DIR / "sessions").glob(f"*/*/*/rollout-*{sid}.jsonl"))) if (CODEX_DIR / "sessions").exists() else False
+        kind = "codex" if is_codex else "claude"
+        if cmd == "park":
+            try:
+                days, note, someday = parse_park_args(rest[1:])
+            except ValueError as e:
+                print(f"usage: sessions park SID [--days N | --someday] [--note TEXT]   ({e})", file=sys.stderr)
+                return 2
+            wake = None if someday else wake_for_days(days, now_ts())
+            ledger_append(sid, "parked", kind, wake, note, "skill")
+            print(f"parked {sid[:8]}: wakes {'someday' if someday else 'in ' + str(days) + 'd'}" + (f" · {note}" if note else ""))
+            return 0
+        if cmd == "done":
+            ledger_append(sid, "done", kind, src="skill")
+            print(f"done {sid[:8]}")
+            return 0
+        if cmd == "touch":
+            last = ledger_last().get(sid)
+            if last and last["state"] == "active" and now_ts() - last["ts"] < 600:
+                return 0          # throttle: one event per 10 min
+            ledger_append(sid, "active", kind, src="hook")
+            return 0
+        if cmd == "focus":
+            return cmd_focus(sid)
+        if cmd == "resume":
+            model = build_model()
+            rec = model["sessions"].get(sid) or {"sid": sid, "kind": kind, "info": None}
+            ok, m = do_resume(rec)
+            print(("✓ " if ok else "✗ ") + m)
+            return 0 if ok else 1
+    if cmd == "sweep":
+        model = build_model()
+        res, err = sweep(model, None, "--dry-run" in rest)
+        if err:
+            print(f"refused: {err}", file=sys.stderr)
+            return 1
+        for name, steps in res:
+            print(("would close " if "--dry-run" in rest else "closing ") + name + "  " + " ".join(steps))
+        return 0
+    if cmd == "install":
+        return install()
+    print("unknown command", cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

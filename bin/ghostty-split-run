@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Open a new Ghostty split (like ctrl+shift+o) and run a command in it.
+# Usage: ghostty-split-run [right|down|left|up] [--session SID|--focused|--window N] -- <command...>
+# How: Ghostty exposes split-<dir> as a GTK action over D-Bus, but the new
+# split always starts a plain shell, so the command is handed over through a
+# pending file that ~/.bashrc picks up (and deletes) within 15 s.
+# Target window, in order: --window N / $GHOSTTY_SPLIT_WINDOW; else ghostty-window-of
+# (the window whose title is the session's tab title, else the focused window).
+# The old "newest window" guess is gone: it put /fork-here splits in the wrong window.
+set -euo pipefail
+dir=right; sid=${CLAUDE_CODE_SESSION_ID:-}; focused=; win=${GHOSTTY_SPLIT_WINDOW:-}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    right|down|left|up) dir=$1; shift ;;
+    --session) sid=$2; shift 2 ;;
+    --focused) focused=1; shift ;;
+    --window) win=$2; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+[[ $# -gt 0 ]] || { echo "usage: ghostty-split-run [right|down|left|up] [--session SID|--focused|--window N] -- <command...>" >&2; exit 2; }
+
+if [[ -z "$win" ]]; then
+  if [[ -n "$focused" ]]; then win=$(ghostty-window-of --focused)
+  elif [[ -n "$sid" ]]; then win=$(ghostty-window-of --session "$sid")
+  else win=$(ghostty-window-of); fi
+fi
+[[ "$win" =~ ^[0-9]+$ ]] || { echo "no Ghostty window found on D-Bus" >&2; exit 1; }
+title=$(ghostty-window-of --list 2>/dev/null | awk -v w="$win" '$1==w' | cut -c9-)
+
+pending_dir="${XDG_RUNTIME_DIR:-/tmp}/ghostty-split-run"
+mkdir -p "$pending_dir"
+printf '%q ' "$@" > "$pending_dir/pending.tmp"
+mv "$pending_dir/pending.tmp" "$pending_dir/pending"
+
+gdbus call --session -d com.mitchellh.ghostty -o "/com/mitchellh/ghostty/window/$win" \
+  -m org.gtk.Actions.Activate "split-$dir" '[]' '{}' >/dev/null
+
+# wait for a new shell to claim the command (Ghostty queues the action while no window is focused)
+for _ in $(seq 1 24); do [[ -f "$pending_dir/pending" ]] || break; sleep 0.25; done
+if [[ -f "$pending_dir/pending" ]]; then
+  rm -f "$pending_dir/pending"
+  echo "split-$dir on Ghostty window $win ($title): no new shell picked the command up within 6 s — is a Ghostty window focused?" >&2
+  exit 1
+fi
+echo "split-$dir opened in Ghostty window $win ($title) and the command started"
