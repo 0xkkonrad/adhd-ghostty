@@ -18,7 +18,7 @@ put() {  # put SRC DST [mode]
   install -m "$mode" "$src" "$dst"; echo "install $dst"; changed=1
 }
 
-for f in "$here"/bin/*; do put "$f" "$HOME/.local/bin/$(basename "$f")" 755; done
+for f in "$here"/bin/*; do [[ -f "$f" ]] || continue; put "$f" "$HOME/.local/bin/$(basename "$f")" 755; done   # skip __pycache__ etc.
 for f in "$here"/hooks/*.py; do put "$f" "$HOME/.claude/hooks/$(basename "$f")" 755; done
 for d in "$here"/skills/*/; do
   name=$(basename "$d")

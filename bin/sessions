@@ -9,7 +9,8 @@ the tab, a backlog of sessions that have no tab, and a sweep that closes tabs of
   sessions log                   newest first: sid8  age  status  state  where  title
   sessions park SID [--days N | --someday] [--note TEXT]     (skill form: --args "N note…")
   sessions done SID
-  sessions touch SID             mark active (the tab-status hook calls this on every prompt)
+  sessions pin SID [--toggle] | sessions unpin SID     keep for later at the top (no date, never decays)
+  sessions touch SID             mark active (the tab-status hook calls this on every prompt; pinned stays pinned)
   sessions sweep [--dry-run]     close every sweepable pane (refuses on a stale snapshot)
   sessions focus SID             prints the window + alt+N to press (no programmatic focus on GNOME)
   sessions resume SID            new tab in the focused window running claude -r / codex resume
@@ -56,7 +57,7 @@ DECAY_DAYS = int(ENV("SESSIONS_DECAY_DAYS", "3"))          # unmarked → archiv
 OPEN_GRACE_DAYS = float(ENV("SESSIONS_OPEN_GRACE_DAYS", "1"))   # open + unmarked + idle this long → stale
 SWEEP_COMMS = {c.strip() for c in (ENV("SESSIONS_SWEEP_COMMS") or "claude,codex").split(",") if c.strip()}
 SNAPSHOT_MAX_AGE = 60
-BACKLOG_CAP = 8
+BACKLOG_CAP = 20
 MAX_PARK_DAYS = 3650
 BUS, OBJ = "com.mitchellh.ghostty", "/com/mitchellh/ghostty"
 ICON = {"idle": "⚪", "busy": "🚧", "done": "🟢", "ask": "🔴"}
@@ -66,7 +67,7 @@ TAG_RE = re.compile(r"</?[a-zA-Z_][\w-]*(?:\s[^>]*)?>")
 ICON_RE = re.compile(r"^[\U0001F300-\U0001FAFF☀-➿⬀-⯿️\s]+")
 TITLE_MAX = 48
 DAY = 86400
-SELECTABLE = ("tab", "split", "backlog")
+SELECTABLE = ("tab", "split", "backlog", "pinned")
 
 
 def now_ts():
@@ -191,7 +192,7 @@ def _valid_event(ev):
     if not isinstance(ev, dict):
         return None
     sid, st, ts, wake = ev.get("sid"), ev.get("state"), ev.get("ts"), ev.get("wake")
-    if not isinstance(sid, str) or not sid or st not in ("active", "parked", "done"):
+    if not isinstance(sid, str) or not sid or st not in ("active", "parked", "done", "pinned"):
         return None
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None
@@ -552,10 +553,11 @@ def build_model(now=None):
         rec["wake"] = ev["wake"] if ev else None
         rec["marked"] = ev["state"] if ev else None
         st_m = mtime(TAB_STATUS / f"{rec['sid']}.state") if rec["open"] else None
-        rec["last_activity"] = max(rec["mtime"] or 0, ev["ts"] if ev else 0, st_m or 0, rec.get("proc_start") or 0)
+        ev_ts = ev["ts"] if ev and (ev["state"] == "active" or ev["src"] == "hook") else 0   # gestures (park/pin/done) are not activity
+        rec["last_activity"] = max(rec["mtime"] or 0, ev_ts, st_m or 0, rec.get("proc_start") or 0)
         idle = now - rec["last_activity"] if rec["last_activity"] else 1e12
-        if ev and ev["state"] in ("parked", "done"):
-            rec["state"] = ev["state"]
+        if ev and ev["state"] in ("parked", "done", "pinned"):
+            rec["state"] = ev["state"]            # pinned never decays
         elif rec["open"]:
             rec["state"] = "stale" if idle >= OPEN_GRACE_DAYS * DAY else "active"
         else:
@@ -615,7 +617,7 @@ def build_model(now=None):
 
 
 def sweepable(rec):
-    return rec is not None and rec["open"] and rec["state"] in ("parked", "done", "stale")
+    return rec is not None and rec["open"] and rec["state"] in ("parked", "done", "stale", "pinned")
 
 
 # ----------------------------------------------------------------------------- rows
@@ -635,7 +637,11 @@ def right_text(rec, now, in_tree):
             return f"🧹 ?{rec['archive_in']}d"
         if st == "done":
             return "🧹"
+        if st == "pinned":
+            return "🧹 📌"
         return ""
+    if st == "pinned":
+        return fmt_age(now - rec["last_activity"]) if rec["last_activity"] else ""
     if st == "parked":
         d = days_until(rec["wake"], now) if rec["wake"] else None
         return "" if d is None else f"{max(d, 0)}d"
@@ -656,9 +662,18 @@ def build_rows(model, show_done=False, expand=False, filt=""):
     now, S = model["now"], model["sessions"]
     f = filt.lower()
     rows = []
+    pinned = sorted((r for r in S.values() if r["state"] == "pinned" and (not f or f in r["title"].lower())),
+                    key=lambda r: (-r["last_activity"], r["title"]))
+    for r in pinned:
+        rows.append({"kind": "pinned", "slot": status_slot(r) if r["open"] else "  ", "title": r["title"],
+                     "right": right_text(r, now, False), "sid": r["sid"], "rec": r, "surf": None, "sweep": False})
+    if pinned:
+        rows.append({"kind": "blank", "sid": None})
     for w in model["windows"]:
-        rows.append({"kind": "window", "n": w["n"], "sid": None})
         tabs = w["tabs"]
+        if not tabs:                      # window with only shell/tmux panes: nothing to show
+            continue
+        rows.append({"kind": "window", "n": w["n"], "sid": None})
         for i, t in enumerate(tabs):
             last_tab = i == len(tabs) - 1
             surfs = t["surfaces"]
@@ -686,6 +701,7 @@ def build_rows(model, show_done=False, expand=False, filt=""):
                              "rec": rec, "sweep": sweepable(rec), "win": w["n"], "tab": t["n"], "last_tab": last_tab,
                              "win_title": w["title"]})
                 seen.append(s["sid"])
+    rows.append({"kind": "blank", "sid": None})
     rows.append({"kind": "rule", "sid": None})
     back = [r for r in S.values() if not r["open"] and (r["state"] in ("parked", "unsorted") or (show_done and r["state"] == "done"))]
     if f:
@@ -718,12 +734,19 @@ def render_row(row, w, cursor=False):
     if k == "window":
         head = f"══ {row['n']} "
         return head + "═" * max(0, w - width(head))
+    if k == "blank":
+        return ""
     if k == "rule":
-        return "─" * w
+        return "≡" * w
     if k == "more":
         tail = f"+{row['n']}" if row["n"] > 0 else ""
-        return "─" * max(0, w - width(tail)) + tail
-    left = f"{g}{row['tree']} {row['slot']} " if k in ("tab", "split") else f"{g}   {row['slot']} "
+        return "≡" * max(0, w - width(tail)) + tail
+    if k == "pinned":
+        left = f"📌{'▶' if cursor else ' '}{row['slot']} "
+    elif k in ("tab", "split"):
+        left = f"{g}{row['tree']} {row['slot']} "
+    else:
+        left = f"{g}   {row['slot']} "
     avail = w - width(left) - (width(row["right"]) + 1 if row["right"] else 0)
     left += fit(row["title"], max(0, avail))
     return pad_line(left, row["right"], w)
@@ -961,11 +984,12 @@ HELP = [
     " j/k ↑↓  move        ↵  focus hint / resume",
     " r  resume (closed)   p  park: days or s, note",
     " x  done     a  activate     s  sweep 🧹 panes",
+    " i  pin / unpin (📌 section at the top, never decays)",
     " /  filter   Esc clear   space  detail pane",
     " D  show done   m  whole backlog   q  quit",
     "",
     " ══ N  window   ├N tab (alt+N)   ├─ split   └⑂ fork",
-    " ⚪🚧🟢🔴 live  ▫ codex   right: wait age | Nd wake",
+    " ⚪🚧🟢🔴 live  ▫ codex   right: wait age | Nd wake | 📌",
     " ?Nd archive countdown   🧹 = s closes this pane",
 ]
 
@@ -1135,6 +1159,14 @@ def tui(width_opt=None):
                 state["help"] = True
             elif ch == " ":
                 state["detail"] = not state["detail"]
+            elif ch == "i" and rec:
+                if rec["state"] == "pinned":
+                    ledger_append(rec["sid"], "active", rec["kind"], src="tui")
+                    say(f"unpinned: {rec['title']}")
+                else:
+                    ledger_append(rec["sid"], "pinned", rec["kind"], src="tui")
+                    say(f"pinned: {rec['title']}")
+                rebuild()
             elif ch == "D":
                 state["show_done"] = not state["show_done"]
                 rerows()
@@ -1415,6 +1447,22 @@ def install_ghostty_session():
     return [f"ghostty-session: integration applied (backup {bak.name})"]
 
 
+PIN_SKILL = '''---
+name: pin
+description: Pin or unpin this session (keep it for later at the top of the sessions sidebar, no date, never decays). Use only when the user types /pin.
+disable-model-invocation: true
+---
+
+Run exactly this, with no other steps first (it toggles):
+
+```bash
+sessions pin "$CLAUDE_CODE_SESSION_ID" --toggle
+```
+
+Reply with one line: pinned (kept at the top of the sidebar until unpinned) or unpinned. If it fails, show the error verbatim.
+'''
+
+
 def install():
     did = []
     hook = CLAUDE_DIR / "hooks/tab-status.py"
@@ -1480,6 +1528,11 @@ Reply with one line: done, and that the tab can be swept from the sessions sideb
         done_.parent.mkdir(parents=True, exist_ok=True)
         done_.write_text(done_text)
         did.append(f"wrote {done_}")
+    pin_ = skills / "pin/SKILL.md"
+    if read(pin_) != PIN_SKILL:
+        pin_.parent.mkdir(parents=True, exist_ok=True)
+        pin_.write_text(PIN_SKILL)
+        did.append(f"wrote {pin_}")
     did += install_ghostty_session()
     STATE.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1515,7 +1568,7 @@ def main(argv):
         return cmd_map("--json" in rest)
     if cmd == "log":
         return cmd_log()
-    if cmd in ("park", "done", "touch", "focus", "resume"):
+    if cmd in ("park", "done", "touch", "focus", "resume", "pin", "unpin"):
         if not rest or not rest[0]:
             print(f"usage: sessions {cmd} SID ...", file=sys.stderr)
             return 2
@@ -1538,9 +1591,21 @@ def main(argv):
             return 0
         if cmd == "touch":
             last = ledger_last().get(sid)
-            if last and last["state"] == "active" and now_ts() - last["ts"] < 600:
+            keep = "pinned" if last and last["state"] == "pinned" else "active"   # typing never unpins
+            if last and last["state"] == keep and now_ts() - last["ts"] < 600:
                 return 0          # throttle: one event per 10 min
-            ledger_append(sid, "active", kind, src="hook")
+            ledger_append(sid, keep, kind, src="hook")
+            return 0
+        if cmd in ("pin", "unpin"):
+            last = ledger_last().get(sid)
+            pinned_now = bool(last and last["state"] == "pinned")
+            want = (not pinned_now) if "--toggle" in rest else (cmd == "pin")
+            if want:
+                ledger_append(sid, "pinned", kind, src="skill")
+                print(f"pinned {sid[:8]}")
+            else:
+                ledger_append(sid, "active", kind, src="skill")   # open → active; closed → unsorted, countdown from now
+                print(f"unpinned {sid[:8]}")
             return 0
         if cmd == "focus":
             return cmd_focus(sid)

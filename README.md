@@ -7,6 +7,9 @@ The centre piece is `sessions`, a 56-column sidebar that treats the **session** 
 unit of account:
 
 ```
+📌 🟢 Lisbon Sailing Research                         2h
+📌    Referral v3 success metric                      5d
+
 ══ 1 ═══════════════════════════════════════════════════
  ├1 ⚪ LP Refresh Competitor                          🧹
  ├2 🚧 Design system landing page
@@ -15,43 +18,48 @@ unit of account:
  │ └─ 🟢 Startup Valuation Multiples               🧹 4d
  ├4 🟢 UGC Rate Negotiation                          12m
  │ └⑂ 🟢 Projecting WAU growth                        1h
- ├5 🟢 Lisbon Sailing Research                     🧹 1d
+ ├5 🟢 Lisbon Sailing Research                     🧹 📌
  ├6 🟢 Stale Docs Cleanup                             🧹
 ▶└7 🚧 Multi-Session Dashboard
 ══ 2 ═══════════════════════════════════════════════════
  └1 🔴 Welecja Drive Migration                       40m
-────────────────────────────────────────────────────────
-    🟢 Split payment check                            0d
+
+≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
     🟢 Welecja member explainer                       0d
-       Referral v3 success metric                     3d
+    🟢 Split payment check                            0d
+       closed with hook active line                  ?3d
        Fork UX question                              ?2d
-──────────────────────────────────────────────────────+3
- s 🧹 6                                                ?
+       Bitwarden shadow vault                        ?1d
+       Competitor UK incorporation
+≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡+7
+ s 🧹 5                                                ?
 ```
 
+- Top: `📌` pinned sessions ("keep for later", no date, never decays), newest activity first, age on the right.
 - `══ N ══` window N, `├N` tab N (= Ghostty `alt+N`), `├─` split, `└⑂` split forked from its parent.
 - Left emoji = live status from the Claude Code hook: ⚪ idle, 🚧 working, 🟢 finished (your turn), 🔴 blocked on you.
 - Right column = **your intent**, which outlives the tab: blank = active (🟢/🔴 rows show how long
   they have waited), `Nd` = parked, wakes in N days, `?Nd` = unsorted, auto-archived in N days,
-  🧹 = still holds a tab, `s` closes it.
-- Below the single rule: sessions with no tab anywhere, the backlog. `0d` + 🟢 = due today.
+  🧹 = still holds a tab, `s` closes it (`🧹 📌` = pinned session whose tab can go).
+- Below the `≡` rule: sessions with no tab anywhere, the backlog (cap 20, `m` shows all). `0d` + 🟢 = due today.
 
-Keys: `j/k` move, `↵` focus/resume, `r` resume in a new tab, `p` park (days, note), `x` done,
+Keys: `j/k` move, `↵` focus/resume, `r` resume in a new tab, `p` park (days, note), `i` pin/unpin, `x` done,
 `a` re-activate, `s` sweep, `/` filter, `space` detail pane, `D` show done, `m` expand backlog, `?` help, `q` quit.
-In a Claude session: `/park [days|s] [note]`, `/done`. Typing in a parked session re-activates it.
+In a Claude session: `/park [days|s] [note]`, `/pin` (toggle), `/done`. Typing in a parked session re-activates
+it; typing in a pinned session keeps it pinned.
 
 ## Layout
 
 | path | what |
 |---|---|
-| `bin/sessions` | the sidebar + ledger CLI (`tui`, `map`, `log`, `park`, `done`, `touch`, `sweep`, `focus`, `resume`, `install`) |
+| `bin/sessions` | the sidebar + ledger CLI (`tui`, `map`, `log`, `park`, `pin`, `unpin`, `done`, `touch`, `sweep`, `focus`, `resume`, `install`) |
 | `bin/ghostty-session` | 20 s snapshots of windows → tabs → splits and what runs in them; restore at login; reopen closed windows |
 | `bin/ghostty-split-run`, `bin/ghostty-window-of` | open a split in the right window over D-Bus and run a command in it |
 | `bin/claude-fork-split`, `bin/codex-fork-split` | `/fork-here`: fork the current session into a new split |
 | `hooks/tab-status.py` | Claude Code hook: status icon + short title in the tab, `.state` files the sidebar reads |
-| `skills/` | `/park`, `/done`, `/fork-here` for Claude Code |
+| `skills/` | `/park`, `/pin`, `/done`, `/fork-here` for Claude Code |
 | `shell/bashrc-snippet.sh` | the `~/.bashrc` block that lets a fresh split pick up its command |
-| `tests/run_tests.py` | 63 checks: render, ledger, sweep with real processes, pty keys, install idempotency |
+| `tests/run_tests.py` | 75 checks: render, ledger, sweep with real processes, pty keys, install idempotency |
 | `docs/` | `sessions.md` (operate, reset, limits), `sessions-spec.md` (the agreed design), ghostty-session and tab-status notes |
 
 ## Install

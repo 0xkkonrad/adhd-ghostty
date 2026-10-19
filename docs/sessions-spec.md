@@ -58,6 +58,9 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
 - Reactivation: `sessions touch <sid>` sets active (src=hook). Add ONE call to it in
   `~/.claude/hooks/tab-status.py` on `UserPromptSubmit` (detached, never blocking the hook; must
   not break the hook if `sessions` is missing).
+- **pinned** (`i`, `/pin` toggle, `sessions pin|unpin SID`): keep for later, no date, never decays; a prompt
+  in a pinned session keeps it pinned (the hook writes a `pinned` line); unpin → active if open, else
+  unsorted with the countdown restarting now.
 - Skills: `~/.claude/skills/park/SKILL.md` (`/park [days] [note]`, default 1 day) and
   `~/.claude/skills/done/SKILL.md` (`/done`), each running `sessions park|done "$CLAUDE_CODE_SESSION_ID" ...`
   and replying in one line. Model: `disable-model-invocation: true`, like fork-here.
@@ -78,55 +81,67 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
                                   #   (or `codex resume <thread>`), via D-Bus new-tab + pending file
     sessions install              # add the hook line + skills + program kind; idempotent; prints what it did
 
-## TUI rendering — the agreed mockup (56 cols; width = split width, min 40)
+## TUI rendering — the agreed mockup (56 cols; width = split width, min 40; pinned added 19 Oct)
 ```
+📌 🟢 Lisbon Sailing Research                         2h
+📌    Referral v3 success metric                      5d
+
 ══ 1 ═══════════════════════════════════════════════════
  ├1 ⚪ LP Refresh Competitor                          🧹
  ├2 🚧 Design system landing page
- ├3 ⚪ Shotgun split tree review                  🧹 ?5d
- │ ├─ ▫  codex                                      🧹 ?
+ ├3 ⚪ Shotgun split tree review                  🧹 ?2d
+ │ ├─ ▫  codex                                         —
  │ └─ 🟢 Startup Valuation Multiples               🧹 4d
  ├4 🟢 UGC Rate Negotiation                          12m
  │ └⑂ 🟢 Projecting WAU growth                        1h
- ├5 🟢 Lisbon Sailing Research                     🧹 1d
+ ├5 🟢 Lisbon Sailing Research                     🧹 📌
  ├6 🟢 Stale Docs Cleanup                             🧹
 ▶└7 🚧 Multi-Session Dashboard
 ══ 2 ═══════════════════════════════════════════════════
  └1 🔴 Welecja Drive Migration                       40m
-────────────────────────────────────────────────────────
-    🟢 Split payment check                            0d
+
+≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
     🟢 Welecja member explainer                       0d
-       Referral v3 success metric                     3d
-       Fork UX question                              ?5d
-       Bitwarden shadow vault                        ?6d
+    🟢 Split payment check                            0d
+       closed with hook active line                  ?3d
+       Fork UX question                              ?2d
+       Bitwarden shadow vault                        ?1d
        Competitor UK incorporation
-──────────────────────────────────────────────────────+3
- s 🧹 6                                                ?
+≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡+7
+ s 🧹 5                                                ?
 ```
 Grammar (no legend on screen; `?` key shows it):
-- `══ N ═══…` full-width double rule = window N (registry order). `────…` single rule = below it
-  nothing is open (the backlog). Second single rule carries `+N` = hidden backlog rows (cap 8).
-- Column 0 = cursor gutter: `▶` on the selected row, else space. Column 1 = tree: `├`/`└` + tab
-  index for tabs; ` ├─`/` └─` for splits; ` └⑂` for a split forked from its tab parent.
+- Top: the **pinned** section, one row per pinned session (`📌` 2 cells in the tree column, then the
+  2-cell status slot: live emoji when the session has a tab, two spaces otherwise), sorted by last
+  activity, newest first, no cap; right column = age since last activity (`m`/`h`/`d`). Then one
+  literal empty line. Omitted entirely (with its blank line) when nothing is pinned.
+- `══ N ═══…` full-width double rule = window N (registry order), then the tabs/splits of that window.
+  After the last window one literal empty line, then `≡` × width (U+2261, 1 cell): below it nothing is
+  open (the backlog). The closing `≡` rule carries `+N` = hidden backlog rows (cap 20; `m` lifts it).
+- Column 0 = cursor gutter: `▶` on the selected row, else space (on a pinned row the `▶` replaces the
+  space after `📌`). Column 1 = tree: `├`/`└` + tab index for tabs; ` ├─`/` └─` for splits; ` └⑂` for a
+  split forked from its tab parent.
 - Status slot is always exactly 2 cells: emoji (⚪🚧🟢🔴) or `▫ ` for codex. Title starts after
   one space. Titles are truncated to fit with `…`.
 - Right column, right-aligned to width, meaning by row class:
   - active with tab: blank, except 🟢/🔴 rows show how long they have waited (`12m`, `1h`, `2d`).
   - parked with tab: `🧹` + ` Nd` days until wake (blank after broom if someday).
-  - unsorted with tab: `🧹 ?Nd` days until auto-archive. Codex without id: `🧹 ?`.
+  - pinned with tab: `🧹 📌` (sweepable: the session lives in the pinned list, the tab is not the session).
+  - stale with tab: `🧹 ?Nd` days until auto-archive. Done with tab: `🧹`. Codex without id: `—`.
   - backlog (no tab): parked `Nd` (`0d` due today, then 🟢 in the status slot), someday blank,
-    unsorted `?Nd`. Order: due → wake ascending → unsorted by countdown → someday.
-- Footer: ` s 🧹 N` (N = sweepable panes) left, `?` right. Nothing else.
-- Width handling: compute cell widths with `unicodedata.east_asian_width` (W/F = 2, everything else 1).
-  Emoji VS16 sequences must not appear; use the exact code points above.
+    unsorted `?Nd`. Pinned sessions never appear in the backlog. Order: due → wake ascending →
+    unsorted by recency → someday by recency.
+- Footer: ` s 🧹 N` (N = sweepable panes among the visible rows) left, `?` right. Nothing else.
+- Width handling: compute cell widths with `unicodedata.east_asian_width` (W/F = 2, everything else 1;
+  U+FE0F, U+200D and combining marks 0). Emoji VS16 sequences must not appear; use the exact code points above.
 - Redraw triggers: inotify (via `ctypes` libc inotify, stdlib only) on current.json, events.jsonl,
-  and the claude-tab-status dir; fall back to 2 s polling if inotify is unavailable. Plus a 60 s
-  timer for ages.
+  lineage.json and `*.state` in the claude-tab-status dir; fall back to 2 s polling if inotify is
+  unavailable. Plus a 60 s timer for ages.
 
 ## Keys
     j/k or arrows  move      ↵   focus if open, else resume
     r  resume in new tab     p   park: prompt "days [1]" then "note" (empty ok); Esc cancels
-    x  done                  a   re-activate
+    x  done                  a   re-activate         i   pin / unpin (toggle)
     s  sweep all 🧹 panes (confirm with y when N > 3)
     /  filter rows by substring (Esc clears)     space  toggle detail pane (bottom 7 rows)
     D  show done sessions (toggle)               q    quit     ?  help overlay

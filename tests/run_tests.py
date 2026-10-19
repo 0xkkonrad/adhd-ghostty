@@ -9,9 +9,11 @@ MOCKUP CORRECTIONS — every difference between the spec mockup (sessions-spec.m
   2. codex split right column `—` (spec: `🧹 ?`): a codex pane without a thread id cannot be identified, so it is
      never sweepable (no broom) and `?` collides with the help key.
   3. backlog countdowns `?3d ?2d ?1d` (spec: `?5d ?6d`): 3-day decay, see 1.
-  4. backlog order: due (wake, then recency, then title: Split before Welecja, both parked at the same moment),
-     then wake ascending, then unsorted by recency (most recently active first), then someday by recency.
+  4. backlog order: due (wake, then recency: Welecja's transcript is newer than Split's; park/pin/done gestures do
+     not count as activity), then wake ascending, then unsorted by recency, then someday by recency.
      Spec listed unsorted by countdown.
+  7. pinned (19 Oct, second pass): two pinned rows at the top (Lisbon = open, shows its live 🟢 and `🧹 📌` in the
+     tree; Referral = closed, 5d since last activity), a blank line, `≡` rules instead of `─`, cap 20 so no +N here.
   5. extra rows: "closed with hook active line" (a closed session whose only ledger line is `active` must show
      in the backlog) and "someday item q" (fixture filler to exercise the +N cap).
   6. titles come from the fixture (e.g. "Split payment check please"), not the spec's shortened labels.
@@ -84,16 +86,16 @@ def midnight_plus(days):
 T = {"a": ("LP Refresh Competitor", "idle", 2 * 3600), "b": ("Design system landing page", "busy", 60),
      "c": ("Shotgun split tree review", "idle", 1.5 * DAY), "d": ("Startup Valuation Multiples", "done", 3 * 3600),
      "e": ("UGC Rate Negotiation", "done", 12 * 60), "f": ("Projecting WAU growth", "done", 3600),
-     "g": ("Lisbon Sailing Research", "done", 30 * 60), "h": ("Stale Docs Cleanup", "done", 5 * 60),
+     "g": ("Lisbon Sailing Research", "done", 2 * 3600), "h": ("Stale Docs Cleanup", "done", 5 * 60),
      "i": ("Multi-Session Dashboard", "busy", 10), "j": ("Welecja Drive Migration", "ask", 40 * 60)}
 for k, (title, st, ago) in T.items():
     status(SIDS[k], st, ago, title)
     write_transcript(SIDS[k], f"first prompt of {title}", f"last prompt of {title} with several words to wrap around the pane",
                      f"answer about {title} that is long enough to need wrapping onto a second line of the detail pane",
-                     NOW - (1.5 * DAY if k == "c" else 600), forked_from=SIDS["e"] if k == "f" else None)
+                     NOW - (1.5 * DAY if k == "c" else 2 * 3600 if k == "g" else 600), forked_from=SIDS["e"] if k == "f" else None)
 write_transcript(SIDS["k"], "Split payment check please", "pay kanad", "paid 7/12", NOW - 2 * DAY)
 write_transcript(SIDS["l"], "Welecja member explainer", "draft it", "drafted", NOW - DAY)
-write_transcript(SIDS["m"], "Referral v3 success metric", "which metric", "activation", NOW - DAY)
+write_transcript(SIDS["m"], "Referral v3 success metric", "which metric", "activation", NOW - 5 * DAY)
 write_transcript(SIDS["n"], "i just forked a session using /fork how do i pick it up", "ok", "use -r", NOW - 1.2 * DAY)
 write_transcript(SIDS["o"], "set up a bitwarden shadow vault for secrets", "ok", "done", NOW - 2.2 * DAY)
 write_transcript(SIDS["p"], "map competitor UK incorporations", "ok", "38 mapped", NOW - 1800, compact="Competitor UK incorporation")
@@ -106,8 +108,10 @@ ev = []
 def park(k, days=None, note=""):
     ev.append({"ts": NOW - 100, "sid": SIDS[k], "kind": "claude", "state": "parked",
                "wake": midnight_plus(days) if days is not None else None, "note": note, "src": "tui"})
-park("a"); park("d", 4, "before Hugo call"); park("g", 1, "pay + NIF, then book"); park("h")
-park("k", 0, "aleks owes"); park("l", 0, "after takeout"); park("m", 3); park("p")
+park("a"); park("d", 4, "before Hugo call"); park("h")
+park("k", 0, "aleks owes"); park("l", 0, "after takeout"); park("p")
+ev.append({"ts": NOW - 3 * 3600, "sid": SIDS["g"], "kind": "claude", "state": "pinned", "wake": None, "note": "", "src": "tui"})
+ev.append({"ts": NOW - 5 * DAY, "sid": SIDS["m"], "kind": "claude", "state": "pinned", "wake": None, "note": "", "src": "skill"})
 for k in "qrstu":
     park(k)
 ev.append({"ts": NOW - 50, "sid": SIDS["v"], "kind": "claude", "state": "done", "wake": None, "note": "", "src": "tui"})
@@ -143,6 +147,9 @@ WINDOWS = [
 (GS / "current.json").write_text(json.dumps(snapshot(WINDOWS)))
 
 EXPECTED = """\
+📌 🟢 Lisbon Sailing Research                         2h
+📌    Referral v3 success metric                      5d
+
 ══ 1 ═══════════════════════════════════════════════════
  ├1 ⚪ LP Refresh Competitor                          🧹
  ├2 🚧 Design system landing page
@@ -151,21 +158,25 @@ EXPECTED = """\
  │ └─ 🟢 Startup Valuation Multiples               🧹 4d
  ├4 🟢 UGC Rate Negotiation                          12m
  │ └⑂ 🟢 Projecting WAU growth                        1h
- ├5 🟢 Lisbon Sailing Research                     🧹 1d
+ ├5 🟢 Lisbon Sailing Research                     🧹 📌
  ├6 🟢 Stale Docs Cleanup                             🧹
  └7 🚧 Multi-Session Dashboard
 ══ 2 ═══════════════════════════════════════════════════
  └1 🔴 Welecja Drive Migration                       40m
-────────────────────────────────────────────────────────
-    🟢 Split payment check please                     0d
+
+≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
     🟢 Welecja member explainer                       0d
-       Referral v3 success metric                     3d
+    🟢 Split payment check please                     0d
        closed with hook active line                  ?3d
        i just forked a session using /fork how do i… ?2d
        set up a bitwarden shadow vault for secrets   ?1d
        Competitor UK incorporation
        someday item q
-──────────────────────────────────────────────────────+4
+       someday item r
+       someday item s
+       someday item t
+       someday item u
+≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
  s 🧹 5                                                ?"""
 
 
@@ -185,6 +196,14 @@ def run(*args, now=NOW, state=ST, gs=GS, extra=None):
 
 def cells(s):
     return sum(0 if (c in "️‍" or unicodedata.category(c) == "Mn") else (2 if unicodedata.east_asian_width(c) in "WF" else 1) for c in s)
+
+
+def backlog_lines(out):
+    """Rows between the opening ≡ rule and the closing ≡ rule (which may carry +N)."""
+    lines = out.splitlines()
+    i = next(i for i, l in enumerate(lines) if l.startswith("≡" * 20))
+    j = next(j for j, l in enumerate(lines) if j > i and l.startswith("≡" * 20))
+    return [l for l in lines[i + 1:j] if l.strip()]
 
 
 def strip_ansi(s):
@@ -234,7 +253,7 @@ try:
     check("park → parked, 2d, note", rc == 0 and m["state"] == "parked" and m["note"] == "tomorrow-ish"
           and (datetime.fromtimestamp(m["wake"]).date() - datetime.fromtimestamp(NOW).date()).days == 2, f"{out}{err} {m}")
     rc, out, _ = run("tui", "--once", "--width", "56", state=st2)
-    check("park shows 🧹 2d in tree", "🧹 2d" in out.splitlines()[2], out)
+    check("park shows 🧹 2d in tree", re.search(r"^ ├2 🚧 Design system landing page\s+🧹 2d$", out, re.M) is not None, out)
     run("touch", sid, state=st2)
     check("touch → active", json.loads(run("map", "--json", state=st2)[1])["sessions"][sid]["state"] == "active")
     run("done", sid, state=st2)
@@ -260,14 +279,44 @@ try:
     check("decay branch taken: 'w' (ledger-active, closed) → done + hidden after 3d",
           S4.get(SIDS["w"], {}).get("state") == "done" and S4[SIDS["w"]].get("hidden") is True, str(S4.get(SIDS["w"])))
     check("decay: unmarked 'o' out of the universe (or done) after 3d", SIDS["o"] not in S4 or S4[SIDS["o"]]["state"] == "done")
-    check("decay: parked 'm' survives and is due", S4[SIDS["m"]]["state"] == "parked" and S4[SIDS["m"]]["due"])
+    check("decay: parked 'k' survives and is due", S4[SIDS["k"]]["state"] == "parked" and S4[SIDS["k"]]["due"])
+    S30 = json.loads(run("map", "--json", now=NOW + 30 * DAY)[1])["sessions"]
+    check("pinned never decays (30 d): 'm' still pinned, not hidden", S30[SIDS["m"]]["state"] == "pinned" and not S30[SIDS["m"]].get("hidden"), str(S30.get(SIDS["m"])))
+    rc, out, _ = run("tui", "--once", "--width", "56")
+    body = "\n".join(backlog_lines(out))
+    check("pinned sessions absent from the backlog", "Referral v3" not in body and "Lisbon" not in body, body)
+    check("pinned + open → 🧹 📌 in the tree and 🟢 in the section", re.search(r"^ ├5 🟢 Lisbon Sailing Research\s+🧹 📌$", out, re.M) and out.startswith("📌 🟢 Lisbon"), out)
+    stp = ROOT / "state-pin"; shutil.copytree(ST, stp)
+    run("touch", SIDS["g"], state=stp)
+    Sp = json.loads(run("map", "--json", state=stp)[1])["sessions"]
+    lastp = [json.loads(l) for l in (stp / "events.jsonl").read_text().split("\n") if l.strip().startswith("{")][-1]
+    check("touch keeps pinned (hook writes a pinned line)", Sp[SIDS["g"]]["state"] == "pinned" and lastp["state"] == "pinned" and lastp["src"] == "hook", str(lastp))
+    run("unpin", SIDS["g"], state=stp); run("unpin", SIDS["m"], state=stp)
+    Sp = json.loads(run("map", "--json", state=stp)[1])["sessions"]
+    check("unpin open → active; unpin closed → unsorted with countdown restarted (3d)",
+          Sp[SIDS["g"]]["state"] == "active" and Sp[SIDS["m"]]["state"] == "unsorted" and Sp[SIDS["m"]]["archive_in"] == 3, f"{Sp[SIDS['g']]['state']} {Sp[SIDS['m']]['state']} {Sp[SIDS['m']]['archive_in']}")
+    rc, out, _ = run("tui", "--once", "--width", "56", state=stp)
+    check("nothing pinned → no section, no leading blank line", out.startswith("══ 1 ") and "📌" not in out, out[:120])
+    run("pin", SIDS["m"], state=stp)
+    rc, out, _ = run("tui", "--once", "--width", "56", state=stp)
+    check("pin CLI → section at top with age", out.startswith("📌    Referral v3 success metric") and out.splitlines()[0].endswith("5d") and out.splitlines()[1] == "", out[:200])
+    rc, out, _ = run("pin", SIDS["m"], "--toggle", state=stp)
+    check("pin --toggle on a pinned session unpins", "unpinned" in out, out)
+    stc = ROOT / "state-cap"; shutil.copytree(ST, stc)
+    with open(stc / "events.jsonl", "a") as fh:
+        for i in range(30):
+            fh.write(json.dumps({"ts": NOW - 100, "sid": f"{900 + i:08x}-0000-0000-0000-000000000000", "kind": "claude", "state": "parked", "wake": None, "note": "", "src": "tui"}) + "\n")
+    rc, out, _ = run("tui", "--once", "--width", "56", state=stc)
+    check("backlog cap 20 with +N", len(backlog_lines(out)) == 20 and re.search(r"≡+\+\d+$", out, re.M), str(len(backlog_lines(out))) + out[-80:])
+    rc, out2, _ = run("tui", "--once", "--width", "56", "--all", state=stc)
+    check("--all lifts the cap", len(backlog_lines(out2)) > 20)
     S = json.loads(run("map", "--json")[1])["sessions"]
     check("closed + hook-active line → unsorted in backlog", S[SIDS["w"]]["state"] == "unsorted" and S[SIDS["w"]]["archive_in"] == 3, str(S[SIDS["w"]]))
     check("bad ledger lines ignored (b still active)", S[SIDS["b"]]["state"] == "active")
     rc, out, _ = run("tui", "--once", "--width", "56", "--done")
     check("--done shows closed done row with blank right column", re.search(r"^       a finished thing$", out, re.M) is not None, out)
     rc, out, _ = run("tui", "--once", "--width", "56", "--all")
-    check("--all expands the backlog (no +N)", "+4" not in out and "someday item u" in out, out)
+    check("--all expands the backlog", "someday item u" in out and not re.search(r"≡\+\d", out), out)
     rc, out, _ = run("tui", "--once", "--width", "56", extra={"SESSIONS_OPEN_GRACE_DAYS": "5"})
     check("SESSIONS_OPEN_GRACE_DAYS=5 → tab 3 not stale", re.search(r"Shotgun split tree review$", out, re.M) is not None, out)
 
@@ -419,11 +468,11 @@ try:
     pid, fdm = spawn_tui(st3)
     time.sleep(1.2)
     first = strip_ansi(send(fdm, b"", 0.1))
-    check("pty: first frame, cursor on first selectable row", "▶├1 ⚪ LP Refresh Competitor" in first, first[:400])
+    check("pty: first frame, cursor on first selectable row (pinned)", "📌▶🟢 Lisbon Sailing Research" in first, first[:400])
     scr = strip_ansi(send(fdm, b"k"))
-    check("pty: k at top stays on a selectable row", "▶├1" in scr, scr[:200])
-    scr = strip_ansi(send(fdm, b"j"))
-    check("pty: j moves to tab 2", "▶├2" in scr, scr[:300])
+    check("pty: k at top stays on a selectable row", "📌▶🟢" in scr, scr[:200])
+    send(fdm, b"j"); send(fdm, b"j"); scr = strip_ansi(send(fdm, b"j"))
+    check("pty: j skips the blank + window rows, lands on tab 2", "▶├2" in scr, scr[:400])
     scr = strip_ansi(send(fdm, b"p"))
     check("pty: p opens days prompt", "park: days" in scr, scr[-300:])
     scr = strip_ansi(send(fdm, b"\x1b"))
@@ -437,11 +486,19 @@ try:
     send(fdm, b"k"); scr = strip_ansi(send(fdm, b"x", 0.8))
     last = ledger3()[-1]
     check("pty: x writes done", last["sid"] == SIDS["a"] and last["state"] == "done", str(last))
+    send(fdm, b"a")                                  # back to active so the i-toggle test below starts clean
     n1 = len(ledger3())
     scr = strip_ansi(send(fdm, b"r", 0.6))
     check("pty: r on an open row → focus hint, no resume", '→ "Competitor Positioning Analysis" · alt+1' in scr and len(ledger3()) == n1, scr[-300:])
     scr = strip_ansi(send(fdm, b"\r", 0.6))
     check("pty: ↵ on an open row → same hint", "alt+1" in scr, scr[-300:])
+    n2 = len(ledger3())
+    scr = strip_ansi(send(fdm, b"i", 0.8))
+    lp = ledger3()[-1]
+    check("pty: i pins the selected row (LP Refresh → 📌 section)", lp["sid"] == SIDS["a"] and lp["state"] == "pinned" and "📌▶⚪ LP Refresh Competitor" in scr, str(lp) + scr[:200])
+    scr = strip_ansi(send(fdm, b"i", 0.8))
+    lp = ledger3()[-1]
+    check("pty: i again unpins (active line)", lp["sid"] == SIDS["a"] and lp["state"] == "active" and len(ledger3()) == n2 + 2, str(lp))
     time.sleep(4.2)                                   # let the 4 s focus hint expire so the footer shows the count
     send(fdm, b"/"); send(fdm, b"Startup"); scr = strip_ansi(send(fdm, b"\r", 0.6))
     lines = [l for l in scr.split("\n") if l.strip()]
@@ -456,10 +513,10 @@ try:
     scr = strip_ansi(send(fdm, b"D", 0.6))
     check("pty: D again hides them", "a finished thing" not in scr, scr)
     scr = strip_ansi(send(fdm, b"m", 0.6))
-    check("pty: m expands the backlog", "someday item u" in scr and "+4" not in scr, scr)
+    check("pty: m toggles backlog expansion (no +N either way here)", "someday item u" in scr and not re.search(r"≡\+\d", scr), scr[-300:])
     send(fdm, b"m")
     scr = strip_ansi(send(fdm, b" ", 0.6))
-    check("pty: space opens the 7-row detail pane", scr.count("═" * 56) == 1 and "you    last prompt of" in scr and "claude answer about" in scr, scr)
+    check("pty: space opens the 7-row detail pane", scr.count("═" * 56) == 1 and re.search(r"^ you    \S", scr, re.M) and re.search(r"^ claude \S", scr, re.M), scr)
     fcntl.ioctl(fdm, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 56, 0, 0))
     os.kill(pid, signal.SIGWINCH)
     scr = strip_ansi(send(fdm, b"", 0.8))
