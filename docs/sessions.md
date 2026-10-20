@@ -25,9 +25,10 @@ Tool: `~/.local/bin/sessions` (python3 stdlib, one file, no root). Tests: `sessi
        Competitor UK incorporation                        parked someday
 ══════════════════════════════════════════════════════+3   hidden history rows (cap 40; m shows all)
                                                            (blank line)
-══ keys ════════════════════════════════════════════════   cheatsheet (hidden under 20 rows / 56 cols)
- ↵ open  r resume  p pin  s snooze  x done  a active
- / filter  ␣ detail  D show done  m more  ? help  q quit
+══ keys ════════════════════════════════════════════════   cheatsheet, keys bold yellow (hidden under 20 rows / 53 cols)
+ ↵ open       r resume     p pin        s snooze
+ x done       a active     / filter     ␣ detail
+ D show done  m more       ? help       q quit
  c 🧹 5                                                ?   c closes the 5 🧹 panes; ? = legend overlay
 ```
 Left emoji = live status from `~/.claude/hooks/tab-status.py` (⚪ idle 🚧 working 🟢 finished 🔴 blocked).

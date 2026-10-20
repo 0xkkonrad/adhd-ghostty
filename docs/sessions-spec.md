@@ -115,8 +115,9 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
 ══════════════════════════════════════════════════════+7
 
 ══ keys ════════════════════════════════════════════════
- ↵ open  r resume  p pin  s snooze  x done  a active
- / filter  ␣ detail  D show done  m more  ? help  q quit
+ ↵ open       r resume     p pin        s snooze
+ x done       a active     / filter     ␣ detail
+ D show done  m more       ? help       q quit
  c 🧹 5                                                ?
 ```
 Grammar (no legend on screen; `?` key shows it):
@@ -140,8 +141,8 @@ Grammar (no legend on screen; `?` key shows it):
     Closed codex threads (non-subagent rollouts touched within the decay) are backlog rows like any other.
   - history (no tab): parked `Nd` (`0d` due today, then 🟢 in the status slot), someday blank, unsorted `?Nd`.
     Order: due → wake ascending → unsorted by recency → someday by recency.
-- Footer: a blank line, `══ keys ══` rule, two cheatsheet lines (shown when the terminal has ≥ 20 rows and
-  ≥ 56 columns), then ` c 🧹 N` (N = closable panes among the visible rows) left, `?` right. Nothing else.
+- Footer: a blank line, a dim `══ keys ══` rule, the cheatsheet as a 4-column grid (keys bold yellow; shown
+  when the terminal has ≥ 20 rows and ≥ 53 columns; `--once` prints it uncoloured), then ` c 🧹 N` (N = closable panes among the visible rows) left, `?` right. Nothing else.
 - Width handling: `unicodedata.east_asian_width` (W/F = 2, everything else 1; U+FE0F, U+200D and combining
   marks 0). Emoji VS16 sequences must not appear; use the exact code points above.
 - Redraw triggers: inotify (via `ctypes` libc inotify, stdlib only) on current.json, events.jsonl, lineage.json

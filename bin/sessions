@@ -886,24 +886,40 @@ def sweep_count(rows):
     return sum(1 for r in rows if r.get("sweep"))
 
 
-KEYS = [" ↵ open  r resume  p pin  s snooze  x done  a active",
-        " / filter  ␣ detail  D show done  m more  ? help  q quit"]
+KEYS = [("↵", "open"), ("r", "resume"), ("p", "pin"), ("s", "snooze"),
+        ("x", "done"), ("a", "active"), ("/", "filter"), ("␣", "detail"),
+        ("D", "show done"), ("m", "more"), ("?", "help"), ("q", "quit")]
+KEYS_COLS = 4
+KEYS_CELL = max(width(k) + 1 + width(l) for k, l in KEYS) + 2
 KEYS_MIN_ROWS = 20          # the cheatsheet needs the room; short or narrow terminals keep just the footer line
-KEYS_MIN_COLS = max(width(k) for k in KEYS)
+KEYS_MIN_COLS = 1 + KEYS_COLS * KEYS_CELL
+C_KEY, C_DIM, C_OFF = "\033[1;33m", "\033[2m", "\033[0m"          # key: bold yellow; rule: dim
 
 
-def keys_lines(w):
-    """Blank line, titled rule, the two key lines: the cheatsheet that sits above the footer."""
+def keys_lines(w, color=False):
+    """Blank line, titled rule, the keys as a KEYS_COLS-column grid: the cheatsheet above the footer.
+    color=True wraps keys and the rule in ANSI (zero width); the TUI uses it, `--once` does not."""
     head = "══ keys "
-    return ["", head + "═" * max(0, w - width(head))] + [fit(k, w) for k in KEYS]
+    rule = head + "═" * max(0, w - width(head))
+    out = ["", (C_DIM + rule + C_OFF) if color else rule]
+    for i in range(0, len(KEYS), KEYS_COLS):
+        line = " "
+        for k, l in KEYS[i:i + KEYS_COLS]:
+            pad = " " * (KEYS_CELL - width(k) - 1 - width(l))
+            line += ((C_KEY + k + C_OFF) if color else k) + " " + l + pad
+        out.append(line.rstrip())
+    return out
 
 
-def render(model, rows, w=56, cursor=None, footer_msg=None, detail=None, height=None):
+def render(model, rows, w=56, cursor=None, footer_msg=None, detail=None, height=None, color=False):
     w = max(40, w)
     lines = [render_row(r, w, cursor is not None and i == cursor) for i, r in enumerate(rows)]
     default_footer = f" c 🧹 {sweep_count(rows)}" if model.get("fresh", True) else " snapshot stale"
     footer = pad_line(footer_msg if footer_msg is not None else default_footer, "?", w)
-    keys = keys_lines(w) if (height is None or height >= KEYS_MIN_ROWS) and w >= KEYS_MIN_COLS else []
+    if color and footer_msg is None and model.get("fresh", True):
+        footer = footer.replace(" c 🧹", f" {C_KEY}c{C_OFF} 🧹", 1)
+        footer = footer[:-1] + C_KEY + "?" + C_OFF
+    keys = keys_lines(w, color) if (height is None or height >= KEYS_MIN_ROWS) and w >= KEYS_MIN_COLS else []
     footer = keys + [footer]
     body = lines
     if height:
@@ -1242,7 +1258,7 @@ def tui(width_opt=None):
             if state["help"]:
                 lines = ([fit(h, w) for h in HELP] + [""] * rows_)[:rows_]
             else:
-                lines = render(model, rows, w, state["cursor"], foot, det, rows_)
+                lines = render(model, rows, w, state["cursor"], foot, det, rows_, color=True)
             out.write("\033[H")
             for i, l in enumerate(lines):
                 out.write("\033[2K" + l + ("\r\n" if i < len(lines) - 1 else ""))

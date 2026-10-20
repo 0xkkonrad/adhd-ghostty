@@ -181,8 +181,9 @@ EXPECTED = """\
 ════════════════════════════════════════════════════════
 
 ══ keys ════════════════════════════════════════════════
- ↵ open  r resume  p pin  s snooze  x done  a active
- / filter  ␣ detail  D show done  m more  ? help  q quit
+ ↵ open       r resume     p pin        s snooze
+ x done       a active     / filter     ␣ detail
+ D show done  m more       ? help       q quit
  c 🧹 5                                                ?"""
 
 
@@ -247,7 +248,7 @@ try:
         over = [l for l in lines if cells(l) > w]
         right = [l for l in lines[:-1] if re.search(r"(\s\d+[dmh]|\s\?\d+d|\s🧹( \S+)?|\s—)$", l)]
         bad = [l for l in right if cells(l) != w]
-        check(f"width {w}: no overflow, right column aligned", rc == 0 and not over and not bad and len(lines) == len(EXPECTED.splitlines()) - (4 if w < 56 else 0),
+        check(f"width {w}: no overflow, right column aligned", rc == 0 and not over and not bad and len(lines) == len(EXPECTED.splitlines()) - (5 if w < 53 else 0),
               f"over={over[:3]} bad={bad[:3]} n={len(lines)}\n{out}")
 
     # 3. ledger round trip (scratch state)
