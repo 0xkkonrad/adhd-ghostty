@@ -34,7 +34,7 @@ always reopens what was last open". Tool: `~/.local/bin/ghostty-session` (python
   AT-SPI shows all tab titles (in order), which frame is focused (ACTIVE state) and the split geometry
   of the *visible* tab only. Every tick the registry is **reconciled** with that: one registry window per
   frame, one tab slot per tab title, each slot anchored by the surface whose title matches (claude →
-  tab-status title, shell → bash's "⚪ \w" / "🚧 cmd"; codex/tmux have no usable title). A surface's
+  tab-status title, shell → bash's "⚪ \w" / "🚧 cmd", codex → its thread name; tmux has no usable title). A surface's
   tab-mates (splits) follow it. The visible tab is then verified against its terminal rectangles: members
   whose pty size matches no rectangle are moved out, rectangles without a member pull in a surface of that
   size when unambiguous. Pty sizes of hidden tabs are stale (GTK does not resize hidden pages), so splits
@@ -58,6 +58,14 @@ always reopens what was last open". Tool: `~/.local/bin/ghostty-session` (python
   "left + right column stacked" layouts; equal 3-column layouts come back as 50/25/25. No tab titles
   are set (D-Bus has no set-title); the tab-status hook titles the tabs from the sessions.
 - Stale codex locks (`~/.codex/thread-writer-locks/*.lock`) are deleted before `codex resume`.
+- Codex (20 Oct 2026): the codex TUI keeps no fd to its rollout, so a pane's thread is read from the terminal
+  title codex sets (`[ ! ] Action Required | <thread name> | <project>`, `⠋ <name> | <project>`): a tab whose
+  title parses that way names its single codex pane; the id is the newest thread of that name in
+  `~/.codex/session_index.jsonl`, or comes from `codex resume <id>` argv, or is the named thread created right
+  after the pane's process started (ids are UUIDv7). Once known, id + name live in `registry.json` (`codex`) and
+  the name anchors the tab like a claude title does. Tab titles are copied from the tab bar for every tab when
+  the tab count agrees with AT-SPI, else only for tabs anchored by their title. `program.state` (ask|busy) is
+  per tick. A pane resumed through the picker in a tab not shown since stays id-less.
 
 ## Ops
     systemctl --user status ghostty-session-save.timer ghostty-session-restore.service

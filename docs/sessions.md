@@ -13,7 +13,7 @@ Tool: `~/.local/bin/sessions` (python3 stdlib, one file, no root). Tests: `sessi
 ══ window 1 ════════════════════════════════════════════   Ghostty window 1 (registry order)
  ├1 ⚪ LP Refresh Competitor                          🧹   ├N = tab N (alt+N in that window)
  ├3 ⚪ Shotgun split tree review                  🧹 ?2d   stale while open: archived in 2d, closable
- │ ├─ ▫  codex                                         —   split; codex has no status; — = no thread id
+ │ ├─ ▫  codex                                         —   split; codex pane without a thread id (— = not parkable/sweepable)
  │ └⑂ 🟢 Projecting WAU growth                        1h   split forked from the tab's session; 🟢 waiting 1h
  ├5 🟢 Lisbon Sailing Research                     🧹 📌   pinned and still open: the tab can be closed
  └7 🚧 Multi-Session Dashboard                             active: blank right column
@@ -90,8 +90,15 @@ Typing in a parked session re-activates it; typing in a pinned session keeps it 
 - Fork lineage, precedence: `~/.local/state/sessions/lineage.json` {child: parent} > the running claude's argv
   (`claude -r PARENT --fork-session`, i.e. /fork-here; persisted to lineage.json when first seen) > the
   transcript's `forkedFrom`. Drawn as `└⑂` only when parent and child share a tab; the detail pane names the parent.
-- Codex thread id: open rollout/lock fd or `codex resume <id>` argv only. No id → `—`, never swept, not parkable.
-  Untested live (no codex was running during the build).
+- Codex (20 Oct 2026): the TUI holds no fd to its rollout (the app-server daemon does), so ghostty-session reads the
+  terminal title the codex TUI sets — `[ ! ] Action Required | <thread name> | <project>` / `⠋ <name> | <project>` —
+  and resolves the id from `~/.codex/session_index.jsonl` (newest thread of that name), from `codex resume <id>`
+  argv, or from the named thread created right after the pane's process started (codex ids are UUIDv7). Resolved
+  id + name are kept in the registry while the pane lives. The sidebar titles codex rows index name > snapshot
+  label > first user turn of the rollout; `🚧`/`🔴` come from the title's spinner / Action Required (that tick).
+  Closed codex threads enter the backlog from rollout mtimes (subagent threads excluded) since codex has no hook.
+  Rollout reads are head + tail seeks (first/last user turn, last `task_complete`), cached like transcripts.
+  No id → `—`, never swept, not parkable (e.g. resumed through the picker in a tab not shown since).
 - Redraw: inotify (ctypes) on `current.json`, `events.jsonl`, `lineage.json` and `*.state` in the tab-status
   dir, 500 ms debounce; 60 s tick for ages; SIGWINCH via self-pipe; SIGTERM exits 143 with the terminal restored.
 - Resume (`r`/`↵` on a closed row): `new-tab` over D-Bus on the focused window + the ghostty-split-run pending
@@ -139,12 +146,13 @@ Uninstall: `cp ~/.claude/hooks/tab-status.py.bak-20261019 ~/.claude/hooks/tab-st
 `cp ~/.local/bin/ghostty-session.bak-20261019 ~/.local/bin/ghostty-session`; `rm -r ~/.claude/skills/park
 ~/.claude/skills/done ~/.local/state/sessions ~/.cache/sessions ~/.local/bin/sessions`.
 Reset intent only: delete `~/.local/state/sessions/events.jsonl` (and `lineage.json`).
-Tests: `python3 -I tests/run_tests.py` (from the repo ~/workspace/adhd-ghostty) — 75 checks, fixtures in a temp dir, real throwaway
+Tests: `python3 -I tests/run_tests.py` (from the repo ~/workspace/adhd-ghostty) — 101 checks, fixtures in a temp dir, real throwaway
 process trees for the sweep checks (including the kill-time snapshot re-check), a pty for keys/SIGWINCH/SIGTERM.
 
 ## Deviations from the spec mockup (also listed at the top of run_tests.py)
 1. Tab 3 shows `🧹 ?2d`, backlog `?3d ?2d ?1d` (spec `?5d/?6d`): decay is 3 days; numbers were illustrative.
 2. Codex pane without id: `—`, no broom, never swept (spec `🧹 ?`): unidentifiable panes must not be killed; `?` is the help key.
+   Codex rows do show 🚧/🔴 when the codex terminal title carries a run state (spec said "no status").
 3. Backlog order: due (wake, recency, title) → wake ascending → unsorted by recency → someday by recency (spec: unsorted by countdown).
 4. A closed session with only an `active` ledger line is in the backlog (spec implied hidden).
 5. "Stale while open" (idle ≥ 1 day) was added; the spec's rules did not say how an open session could be unsorted.

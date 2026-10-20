@@ -29,7 +29,8 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
    Hidden-tab split layouts are a best guess (see ghostty-session.md); we only need membership.
 2. Live status: `$XDG_RUNTIME_DIR/claude-tab-status/<sid>.state` = idle|busy|done|ask, written by
    `~/.claude/hooks/tab-status.py`; `<sid>.title` = short title. Icons: idle ⚪ busy 🚧 done 🟢 ask 🔴.
-   Codex surfaces have no status: show `▫` padded to 2 cells.
+   Codex surfaces: `▫` padded to 2 cells, or 🚧/🔴 when ghostty-session read a run state from the codex
+   TUI's terminal title (`program.state` = busy|ask in the snapshot).
 3. Transcripts: `~/.claude/projects/<project-slug>/<sid>.jsonl` (slug = cwd with `/` → `-`;
    for cwd /home/kkonrad/workspace it is `-home-kkonrad-workspace`; search all project dirs for
    the sid if cwd unknown). Useful records (one JSON object per line):
@@ -41,9 +42,12 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
    - file mtime = last activity.
    Title precedence: custom-title > tab-status .title > ai-title > first 48 chars of first prompt.
 4. Codex: `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`. The thread id is in the first
-   line (`session_meta` / `id`). ghostty-session currently records `id: null` for codex surfaces;
-   derive the open rollout file from the codex pid's open fds (`/proc/<pid>/fd`) and read the id.
-   If that fails, show the codex row with `?` and no id (it cannot be parked/resumed).
+   line (`session_meta` / `id`); user turns are `response_item`/`message` role user, the assistant's
+   last answer is `event_msg`/`task_complete.last_agent_message`. The TUI process holds no fd to the
+   rollout (the app-server daemon does), so ghostty-session gets id + name from the terminal title the
+   TUI sets (`<thread name> | <project>`, run state in front) + `~/.codex/session_index.jsonl`, from
+   `codex resume <id>` argv, or from the named thread created right after the pane started (UUIDv7).
+   `program.label` = thread name, `program.state` = ask|busy. No id → `—` (not parkable/sweepable).
 5. Fork lineage: `forkedFrom.sessionId`. A session is drawn as a child of its parent **only when
    both are open in the same tab**; otherwise lineage is shown in the detail pane, not the tree.
 
@@ -129,6 +133,7 @@ Grammar (no legend on screen; `?` key shows it):
   - parked with tab: `🧹` + ` Nd` days until wake (blank after broom if someday).
   - pinned with tab: `🧹 📌` (closable: the session lives in the pinned list, the tab is not the session).
   - stale with tab: `🧹 ?Nd` days until auto-archive. Done with tab: `🧹`. Codex without id: `—`.
+    Closed codex threads (non-subagent rollouts touched within the decay) are backlog rows like any other.
   - history (no tab): parked `Nd` (`0d` due today, then 🟢 in the status slot), someday blank, unsorted `?Nd`.
     Order: due → wake ascending → unsorted by recency → someday by recency.
 - Footer: ` c 🧹 N` (N = closable panes among the visible rows) left, `?` right. Nothing else.

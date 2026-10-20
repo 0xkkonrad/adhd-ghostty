@@ -39,6 +39,7 @@ unit of account:
 - `══ 📌 pinned ══`: sessions kept for later (no date, never decays), newest activity first, age on the right.
 - `══ window N ══`, `├N` tab N (= Ghostty `alt+N`), `├─` split, `└⑂` split forked from its parent.
 - Left emoji = live status from the Claude Code hook: ⚪ idle, 🚧 working, 🟢 finished (your turn), 🔴 blocked on you.
+  Codex rows show `▫`, or 🚧 / 🔴 when the codex TUI's terminal title says so (spinner / `Action Required`).
 - Right column = **your intent**, which outlives the tab: blank = active (🟢/🔴 rows show how long
   they have waited), `Nd` = parked, wakes in N days, `?Nd` = unsorted, auto-archived in N days,
   🧹 = still holds a tab, `c` closes it (`🧹 📌` = pinned session whose tab can go).
@@ -87,7 +88,7 @@ Typing in a parked session re-activates it; typing in a pinned session keeps it 
 | `hooks/tab-status.py` | Claude Code hook: status icon + short title in the tab, `.state` files the sidebar reads |
 | `skills/` | `/park`, `/pin`, `/done`, `/fork-here` for Claude Code |
 | `shell/bashrc-snippet.sh` | the `~/.bashrc` block that lets a fresh split pick up its command |
-| `tests/run_tests.py` | 75 checks: render, ledger, sweep with real processes, pty keys, install idempotency |
+| `tests/run_tests.py` | 101 checks: render, ledger, sweep with real processes, pty keys, install idempotency |
 | `docs/` | `sessions.md` (operate, reset, limits), `sessions-spec.md` (the agreed design), ghostty-session and tab-status notes |
 
 ## Install
@@ -122,5 +123,7 @@ Reset the intent of everything by deleting `events.jsonl`.
   nothing exposes, so `↵` on an open row shows the window title and the `alt+N` to press.
 - Split layouts of tabs you have not displayed since splitting them are a best guess (AT-SPI only
   exposes the visible tab); membership is right, direction may not be.
-- Codex rows get a thread id only when it is readable from the process; otherwise they show `—` and
-  are never swept.
+- Codex names come from the terminal title the codex TUI sets (`<thread name> | <project>`) and from
+  `~/.codex/session_index.jsonl`; ids are matched by name, by `codex resume <id>` argv, or by the thread
+  created right after the pane started. A codex pane that resumed a thread through the picker in a tab
+  that has not been shown since stays `codex —` (no id: never swept, not parkable) until its tab is visible.

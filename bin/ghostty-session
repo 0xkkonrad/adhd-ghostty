@@ -56,6 +56,7 @@ PENDING = PENDING_DIR / "pending"
 BUS, OBJ = "com.mitchellh.ghostty", "/com/mitchellh/ghostty"
 CLAUDE_SESSIONS = HOME / ".claude/sessions"
 CODEX_LOCKS = HOME / ".codex/thread-writer-locks"
+CODEX_INDEX = Path(os.environ.get("GHOSTTY_SESSION_CODEX_DIR") or HOME / ".codex") / "session_index.jsonl"   # named threads
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 CLOSED = STATE / "closed.json"      # windows that were closed, newest last (for `reopen` / cold-start)
 RESTORING = STATE / "restoring"     # pid of a restore in progress
@@ -228,6 +229,123 @@ def title_for(sid):
         return None
     t = read(TITLES / f"{sid}.title").strip()
     return t or None
+
+
+# ----------------------------------------------------------------------------- codex
+# The codex TUI shows its thread only in the terminal title it sets (default items: run state + project):
+# "[ ! ] Action Required | <thread name> | <project>", "⠋ <thread name> | <project>", "<project>" (unnamed).
+CODEX_STATE_RE = re.compile(r"^\[ [!.] \] Action Required$")
+
+
+def codex_title_parts(title):
+    """{"name", "id", "state"} (state: ask / busy / None) when the title is a codex one, else None."""
+    t = strip_icon(title)
+    if not t:
+        return None
+    state, keep = None, []
+    for seg in (x.strip() for x in t.split(" | ")):
+        if CODEX_STATE_RE.match(seg):
+            state = "ask"
+            continue
+        if seg and "\u2800" <= seg[0] <= "\u28ff":        # braille spinner frame
+            state, seg = "busy", seg[1:].strip()
+            if not seg:
+                continue
+        keep.append(seg)
+    if len(keep) < 2 and state is None:
+        return None
+    name = " | ".join(keep[:-1]) if len(keep) >= 2 else None
+    return {"name": name, "id": name if name and UUID_RE.fullmatch(name) else None, "state": state}
+
+
+def codex_index():
+    """~/.codex/session_index.jsonl → [{id, name, updated}] (codex names a thread after its first turn)."""
+    out = []
+    for line in read(CODEX_INDEX).split("\n"):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and isinstance(r.get("id"), str) and UUID_RE.fullmatch(r["id"]):
+            out.append({"id": r["id"], "name": str(r.get("thread_name") or ""), "updated": str(r.get("updated_at") or "")})
+    return out
+
+
+def uuid7_time(tid):
+    """codex thread ids are UUIDv7: the first 48 bits are unix milliseconds."""
+    try:
+        return int(tid[:8] + tid[9:13], 16) / 1000
+    except ValueError:
+        return None
+
+
+def codex_resolve(windows, surfaces, reg_s, known):
+    """Codex panes: a tab whose title parses as a codex title names its codex pane (label = thread name,
+    id = newest thread of that name in the index, state ask/busy for this tick). A tab with several codex
+    panes only names the one whose label already matches. A pane still without an id takes the named thread
+    created right after its process started (the TUI creates its thread at startup): each such thread goes
+    to the latest-started pane before it, each pane takes the earliest thread it was given.
+    Resolved id + label are kept in reg["codex"] while the pane lives."""
+    cxs = [s for s in surfaces if s["program"].get("kind") == "codex"]
+    if not cxs:
+        return
+    index = codex_index()
+    names = {r["id"]: r["name"] for r in index if r["name"]}
+    for s in cxs:
+        s["program"].pop("state", None)
+        if s["program"].get("id") in names:              # the index is the source of names once the id is known
+            s["program"]["label"] = names[s["program"]["id"]]
+    for w in windows:
+        for t in w["tabs"]:
+            cx = [s for s in cxs if reg_s.get(skey(s), {}).get("tab") == t["id"]]
+            parts = codex_title_parts(t.get("title")) if cx else None
+            if not parts:
+                continue
+            if len(cx) == 1:
+                tgt = cx[0]
+            else:
+                named = [s for s in cx if parts["name"] and s["program"].get("label") == parts["name"]]
+                tgt = named[0] if len(named) == 1 else None
+            if tgt is None:
+                continue
+            p = tgt["program"]
+            if parts["name"] and p.get("id") in names and names[p["id"]] != parts["name"]:
+                continue                                  # that title belongs to another thread: misfiled slot
+            if parts["state"]:
+                p["state"] = parts["state"]
+            if parts["name"] and not p.get("label"):
+                p["label"] = parts["name"]
+            if not p.get("id") and parts["name"]:
+                taken = {x["program"].get("id") for x in cxs}
+                if parts["id"] and parts["id"] not in taken:
+                    p["id"] = parts["id"]
+                else:
+                    same = [r for r in index if r["name"] == parts["name"] and r["id"] not in taken]
+                    if same:
+                        p["id"] = max(same, key=lambda r: r["updated"])["id"]
+    todo = [s for s in cxs if not s["program"].get("id")]
+    if todo:
+        taken = {s["program"].get("id") for s in cxs}
+        votes = {}                                   # pane key → candidate threads
+        for r in index:
+            t = uuid7_time(r["id"])
+            if r["id"] in taken or t is None:
+                continue
+            near = [s for s in todo if -5 <= t - s["start"] <= 30]
+            if near:
+                votes.setdefault(skey(max(near, key=lambda s: s["start"])), []).append(r)
+        for s in todo:
+            c = votes.get(skey(s), [])
+            if c:
+                r = min(c, key=lambda r: uuid7_time(r["id"]))
+                s["program"]["id"] = r["id"]
+                s["program"]["label"] = s["program"].get("label") or r["name"] or None
+    for s in cxs:
+        p = s["program"]
+        if p.get("id") in names:
+            p["label"] = names[p["id"]]
+        if p.get("id") or p.get("label"):
+            known[skey(s)] = {"id": p.get("id"), "label": p.get("label")}
 
 
 def live_surfaces():
@@ -428,7 +546,7 @@ def split_dir(s, prev, rects, max_h):
 
 def surface_title(s):
     """What Ghostty shows as this surface's title (icon stripped): claude → tab-status title,
-    shell → bash's "⚪ \\w" / "🚧 <cmd>" (see ~/.bashrc). codex/tmux: unknown."""
+    shell → bash's "⚪ \\w" / "🚧 <cmd>" (see ~/.bashrc), codex → thread name (see codex_resolve). tmux: unknown."""
     p = s["program"]
     k = p.get("kind")
     if k == "claude":
@@ -436,6 +554,8 @@ def surface_title(s):
         return strip_icon(t) if t else None
     if k == "sessions":
         return "sessions"
+    if k == "codex":
+        return p.get("label") or None
     if k == "shell":
         if p.get("label"):
             return p["label"][:60]
@@ -468,7 +588,9 @@ def reconcile(reg, surfaces, wins, fi):
         for si, want in enumerate(w["slot_titles"]):
             if not want:
                 continue
-            cands = [k for k in by_key if k not in assigned and titles.get(k) == want]
+            cands = [k for k in by_key if k not in assigned and titles.get(k) and
+                     (titles[k] == want or (by_key[k]["program"].get("kind") == "codex" and
+                                            titles[k] == (codex_title_parts(want) or {}).get("name")))]
             if not cands:
                 continue
             k = min(cands, key=lambda k: pref(k, wi))
@@ -489,10 +611,11 @@ def reconcile(reg, surfaces, wins, fi):
         old_tab = v["tab"] if v else None
         if old_tab is not None and claimed.get(old_tab) == (wi, si):
             if windows[wi]["tabs"][si] is None:
-                windows[wi]["tabs"][si] = {"id": old_tab, "title": ""}
+                windows[wi]["tabs"][si] = {"id": old_tab, "title": "", "anchored": True}
                 moved[old_tab] = old_tab
             continue
         tid = new_tab(wi, si) if windows[wi]["tabs"][si] is None else windows[wi]["tabs"][si]["id"]
+        windows[wi]["tabs"][si]["anchored"] = True
         reg_s[k] = {"tab": tid, "kind": "tab", "dir": None, "seq": v["seq"] if v else reg["seq"]}
     def empty_slots():
         return [(wi, si) for wi, w in enumerate(windows) for si, t in enumerate(w["tabs"]) if t is None]
@@ -597,6 +720,15 @@ def save():
 
     live = {skey(s): s for s in surfaces}
     reg_s = reg["surfaces"]
+    known = reg.setdefault("codex", {})          # codex pane key → {id, label} resolved on an earlier tick
+    for k in list(known):
+        if k not in live:
+            del known[k]
+    for k, v in known.items():
+        p = live[k]["program"]
+        if p.get("kind") == "codex":
+            p["id"] = p.get("id") or v.get("id")
+            p["label"] = v.get("label") or p.get("label")
     prev = load_json(CUR, {})
     record_closed_windows(reg, live, prev, now)
     for k in list(reg_s):
@@ -660,7 +792,8 @@ def save():
             tid = f"t{reg['seq']}"
             windows[-1]["tabs"].append({"id": tid, "title": ""})
             reg_s[k] = {"tab": tid, "kind": "tab", "dir": None, "seq": reg["seq"]}
-    # finalize: drop unfilled slots, copy titles from the tab bar
+    # finalize: drop unfilled slots, copy titles from the tab bar (all of them when the counts agree, else
+    # only tabs that were anchored by their title; the position of the rest is a guess)
     final = []
     for wi, w in enumerate(windows):
         aw = wins[wi] if wi < len(wins) else None
@@ -669,8 +802,9 @@ def save():
         for si, t in enumerate(w["tabs"]):
             if t is None:
                 continue
-            if si < len(slot_titles) and len(w["tabs"]) == len(slot_titles):
+            if si < len(slot_titles) and (len(w["tabs"]) == len(slot_titles) or t.pop("anchored", False)):
                 t["title"] = slot_titles[si]
+            t.pop("anchored", None)
             tabs.append(t)
         w.pop("slot_titles", None)
         if not tabs:
@@ -681,6 +815,7 @@ def save():
         w["focused"] = bool((aw or {}).get("focused"))
         final.append(w)
     windows = final
+    codex_resolve(windows, surfaces, reg_s, known)
     reg["windows"] = windows
     reg["a11y"] = a11y_ok
     reg["updated"] = now
@@ -752,7 +887,7 @@ def describe(p):
     if k == "claude":
         return f"claude {p.get('id') or '?'}  {p.get('label') or ''}  ({cwd})".rstrip()
     if k == "codex":
-        return f"codex {p.get('id') or '?'}  ({cwd})"
+        return f"codex {p.get('id') or '?'}  {p.get('label') or ''}  ({cwd})".rstrip()
     if k == "sessions":
         return "sessions (sidebar)"
     if k == "tmux":

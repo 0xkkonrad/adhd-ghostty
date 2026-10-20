@@ -440,6 +440,119 @@ try:
     r = subprocess.run([str(GSB), "save", "bogus"], capture_output=True, text=True)
     check("ghostty-session save bogus → exit 2", r.returncode == 2 and "takes no arguments" in r.stderr)
 
+    # 8. codex: thread names from the TUI's terminal title / the index, ids by name or start time, rollouts
+    def uuid7(t):
+        ms = int(t * 1000)
+        return f"{ms >> 16:08x}-{ms & 0xffff:04x}-7000-8000-000000000000"
+
+    cx_root = ROOT / "codex8"; cx_root.mkdir()          # own dir: the shared fixtures must not gain codex rows
+    cx8 = {"SESSIONS_CODEX_DIR": str(cx_root)}
+    def rollout(tid, started, cwd=CWD, source="user", first="", last_prompt="", last_assistant="", mtime=None, day="2026/10/19"):
+        d = cx_root / "sessions" / day; d.mkdir(parents=True, exist_ok=True)
+        meta = {"id": tid, "cwd": cwd, "thread_source": source, "timestamp": "2026-10-19T21:54:37.758Z"}
+        if source == "subagent":
+            meta["source"] = {"subagent": {"thread_spawn": {"parent_thread_id": SIDS["a"]}}}
+            meta["parent_thread_id"] = SIDS["a"]
+        lines = [json.dumps({"timestamp": "x", "type": "session_meta", "payload": meta}),
+                 json.dumps({"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<skills_instructions>…"}]}}),
+                 json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>cwd</environment_context>"}]}}),
+                 json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": first}]}}),
+                 json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "earlier answer"}}),
+                 json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": last_prompt}]}}),
+                 json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": last_assistant}}),
+                 json.dumps({"type": "event_msg", "payload": {"type": "token_count"}})]
+        f = d / f"rollout-2026-10-19T21-54-37-{tid}.jsonl"
+        f.write_text("\n".join(lines) + "\n")
+        os.utime(f, (mtime or started, mtime or started))
+        return f
+
+    T0 = NOW - 2 * 3600
+    CA, CB, CC, CD, CE, CF = uuid7(T0 + 3), uuid7(T0 + 102), uuid7(T0 + 200), uuid7(T0 - 5 * DAY), uuid7(T0 + 300), uuid7(T0 + 400)
+    rollout(CA, T0 + 3, first="audit the content for seo trust issues please", last_prompt="and the footer?", last_assistant="Footer fixed, three links added.", mtime=NOW - 600)
+    rollout(CB, T0 + 102, first="propose peanut growth plans", mtime=NOW - 3000)
+    rollout(CC, T0 + 200, first="old closed thread", mtime=NOW - 3600)
+    rollout(CD, T0 - 5 * DAY, first="ancient thread", mtime=NOW - 5 * DAY, day="2026/10/14")
+    rollout(CE, T0 + 300, source="subagent", first="subagent work", mtime=NOW - 100)
+    rollout(CF, T0 + 400, first="never named, closed", mtime=NOW - 200)
+    (cx_root / "session_index.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"id": CA, "thread_name": "Audit content SEO trust issues", "updated_at": "2026-10-19T21:56:12Z"},
+        {"id": CB, "thread_name": "Propose Peanut growth plans", "updated_at": "2026-10-19T21:57:10Z"},
+        {"id": CC, "thread_name": "Audit bill-splitting slop", "updated_at": "2026-10-19T21:59:30Z"},
+        {"id": CD, "thread_name": "Ancient codex thread", "updated_at": "2026-10-14T09:00:00Z"},
+        {"id": CE, "thread_name": "Subagent thread", "updated_at": "2026-10-19T22:00:00Z"},
+        {"bad": 1}]) + "not json\n")
+
+    cp = gmod.codex_title_parts
+    check("codex title: run state + name + project", cp("[ ! ] Action Required | Audit content SEO trust issues | workspace") == {"name": "Audit content SEO trust issues", "id": None, "state": "ask"}, str(cp("[ ! ] Action Required | Audit content SEO trust issues | workspace")))
+    check("codex title: spinner frame → busy", cp("⠏ Deslop key marketing surfaces | workspace") == {"name": "Deslop key marketing surfaces", "id": None, "state": "busy"})
+    check("codex title: plain name | project", cp("Propose Peanut growth plans | workspace") == {"name": "Propose Peanut growth plans", "id": None, "state": None})
+    check("codex title: id as name", cp(f"{CA} | workspace")["id"] == CA)
+    check("codex title: claude / shell / project-only titles are not codex titles",
+          cp("🟢 Shotgun Split Tree Review") is None and cp("⚪ ~/workspace") is None and cp("workspace") is None and cp("") is None)
+    check("codex title: state with no name", cp("[ . ] Action Required | workspace") == {"name": None, "id": None, "state": "ask"})
+    check("uuid7_time round-trips", abs(gmod.uuid7_time(CA) - (T0 + 3)) < 0.001 and gmod.uuid7_time("zz") is None)
+
+    gmod.CODEX_INDEX = cx_root / "session_index.jsonl"
+    def gsurf(pid, start, tab, kind="codex", tid=None, label=None):
+        return {"pid": pid, "start": start, "program": {"kind": kind, "id": tid, "label": label, "cwd": CWD, "pid": pid + 1}}, {f"{pid}:{start}": {"tab": tab}}
+    surfs, regs = [], {}
+    for sf, rg in (gsurf(10, T0, "t1"),                                    # tab titled "Action Required | Audit…" → CA by name, ask
+                   gsurf(11, T0 + 100, "t2"),                              # untitled tab (count mismatch), started 2 s before CB → CB by start
+                   gsurf(12, T0 + 5, "t3"), gsurf(13, T0 + 6, "t3", kind="claude", tid=SIDS["a"], label="Claude thing"),   # mixed tab titled by claude → nothing
+                   gsurf(14, T0 + 198, "t4", tid=CC),                      # resume CC in argv: label from the index; tab title names CA → misfiled, skipped
+                   gsurf(15, T0 - 50000, "t5")):                           # unnamed / resumed via picker: nothing, never guessed
+        surfs.append(sf); regs.update(rg)
+    gwin = [{"tabs": [{"id": "t1", "title": "[ ! ] Action Required | Audit content SEO trust issues | workspace"}, {"id": "t2", "title": ""},
+                      {"id": "t3", "title": "🟢 Claude thing"}, {"id": "t4", "title": "Audit content SEO trust issues | workspace"}, {"id": "t5", "title": "workspace"}]}]
+    known = {}
+    gmod.codex_resolve(gwin, surfs, regs, known)
+    P = [sf["program"] for sf in surfs]
+    check("codex_resolve: title names the single codex pane of its tab (id by name, state ask)", P[0]["id"] == CA and P[0]["label"] == "Audit content SEO trust issues" and P[0]["state"] == "ask", str(P[0]))
+    check("codex_resolve: untitled pane takes the thread created right after it started", P[1]["id"] == CB and P[1]["label"] == "Propose Peanut growth plans" and "state" not in P[1], str(P[1]))
+    check("codex_resolve: codex pane in a claude-titled tab stays unresolved", P[2]["id"] is None and P[2].get("label") is None, str(P[2]))
+    check("codex_resolve: known id gets the index name; a tab title naming another thread is ignored", P[4]["id"] == CC and P[4]["label"] == "Audit bill-splitting slop" and "state" not in P[4], str(P[4]))
+    check("codex_resolve: old pane with no title match is never guessed", P[5]["id"] is None and P[5].get("label") is None, str(P[5]))
+    check("codex_resolve: resolved panes persist in the registry", set(known) == {f"10:{T0}", f"11:{T0 + 100}", f"14:{T0 + 198}"} and known[f"10:{T0}"] == {"id": CA, "label": "Audit content SEO trust issues"}, str(known))
+    check("codex_title_parts anchors a codex tab in reconcile (name vs tab title)",
+          gmod.codex_title_parts("⠋ Audit content SEO trust issues | workspace")["name"] == P[0]["label"])
+
+    # the sidebar: titles, status from the title, closed threads in history (subagents and unnamed-but-recent too)
+    gs8 = ROOT / "gs8"; gs8.mkdir(); st8 = ROOT / "state8"; st8.mkdir()
+    def csurf(pid, tid=None, label=None, state=None, dir_=None):
+        prog = {"kind": "codex", "id": tid, "cwd": CWD, "pid": 999990 + pid, "label": label}
+        if state:
+            prog["state"] = state
+        return {"program": prog, "pid": 999900 + pid, "tty": None, "size": None, "dir": dir_, "seq": pid}
+    W8 = [{"title": "x", "focused": True, "tabs": [
+        {"title": "[ ! ] Action Required | Audit content SEO trust issues | workspace", "active": True, "surfaces": [csurf(1, CA, "Audit content SEO trust issues", "ask")]},
+        {"title": "", "active": False, "surfaces": [csurf(2, CB, "Propose Peanut growth plans", "busy")]},
+        {"title": "", "active": False, "surfaces": [csurf(3, None, "Named but unresolved")]},
+        {"title": "", "active": False, "surfaces": [surf("a", pid=4), csurf(5, dir_="right")]},
+    ]}]
+    (gs8 / "current.json").write_text(json.dumps(snapshot(W8)))
+    rc, out, err = run("tui", "--once", state=st8, gs=gs8, extra=cx8)
+    lines8 = out.split("\n")
+    check("codex rows: thread name + 🔴 from the title", " ├1 🔴 Audit content SEO trust issues" in lines8, out)
+    check("codex rows: 🚧 busy", " ├2 🚧 Propose Peanut growth plans" in lines8, out)
+    check("codex rows: named but id-less → name, ▫, —", any(l.startswith(" ├3 ▫  Named but unresolved") and l.rstrip().endswith("—") for l in lines8), out)
+    check("codex rows: no name, no id → codex, —", any(re.match(r"^\s+└─ ▫  codex\s+—$", l.rstrip()) for l in lines8), out)
+    hist8 = out.split("══ history")[1] if "══ history" in out else ""
+    check("history: closed codex threads by name (index) with ?3d", re.search(r"^\s+Audit bill-splitting slop\s+\?3d$", hist8, re.M), hist8)
+    check("history: unnamed closed codex thread → first prompt", "never named, closed" in hist8, hist8)
+    check("history: subagent threads and threads older than the decay are not listed", "Subagent thread" not in out and "subagent work" not in out and "Ancient" not in out and "ancient" not in out, out)
+    rc, out, err = run("map", "--json", state=st8, gs=gs8, extra=cx8)
+    m8 = json.loads(out)["sessions"]
+    check("map --json: codex session kind/title/cwd/status", m8[CA]["kind"] == "codex" and m8[CA]["title"] == "Audit content SEO trust issues" and m8[CA]["cwd"] == CWD and m8[CA]["status"] == "ask", json.dumps(m8.get(CA), default=str)[:400])
+    smod.CODEX_DIR = cx_root
+    ci = smod.codex_info(CA, {})
+    check("codex_info: first/last user turn + last task_complete, wrappers skipped", ci and ci["first_prompt"] == "audit the content for seo trust issues please" and ci["last_prompt"] == "and the footer?" and ci["last_assistant"] == "Footer fixed, three links added." and not ci["subagent"], str(ci))
+    check("codex_info: subagent flagged", smod.codex_info(CE, {})["subagent"] is True)
+    rc, out, err = run("touch", CA, state=st8, gs=gs8, extra=cx8)
+    ev8 = [json.loads(l) for l in (st8 / "events.jsonl").read_text().split("\n") if l.strip()]
+    check("touch on a codex id writes kind codex", rc == 0 and ev8 and ev8[-1]["kind"] == "codex" and ev8[-1]["sid"] == CA, str(ev8))
+    rc, out, err = run("tui", "--once", state=st8, gs=gs8, extra=cx8)
+    check("detail pane source: codex rows render after touch", rc == 0 and " ├1 🔴 Audit content SEO trust issues" in out, out)
+
     # 7. keys through a pty
     def spawn_tui(state, rows=40, cols=56):
         pid, fdm = pty.fork()

@@ -18,7 +18,8 @@ the tab, a backlog of sessions that have no tab, and a sweep that closes tabs of
 
 Sources: ~/.local/state/ghostty-session/current.json (placement, 20 s), $XDG_RUNTIME_DIR/claude-tab-status
 (live status + titles), ~/.claude/projects/*/<sid>.jsonl (head + tail seeks only; cached by mtime),
-~/.codex/sessions (thread ids). Ledger: ~/.local/state/sessions/events.jsonl (append-only, last wins).
+~/.codex/sessions/*/rollout-*.jsonl (codex threads: head + tail seeks, cached) + ~/.codex/session_index.jsonl
+(thread names; ghostty-session puts the name the codex TUI shows in its terminal title into the snapshot). Ledger: ~/.local/state/sessions/events.jsonl (append-only, last wins).
 Lineage: ~/.local/state/sessions/lineage.json. Cache: ~/.cache/sessions/cache.json.
 Spec: ~/fw16-setup/sessions-spec.md   Docs: ~/fw16-setup/sessions.md
 """
@@ -447,15 +448,136 @@ def codex_thread_id(pid):
     return None
 
 
-def codex_info(tid):
+def codex_rollout(tid):
     for p in (CODEX_DIR / "sessions").glob(f"*/*/*/rollout-*{tid}.jsonl"):
-        try:
-            with open(p, "rb") as f:
-                meta = json.loads(f.readline())
-            return {"mtime": mtime(p) or 0, "cwd": (meta.get("payload") or {}).get("cwd", ""), "path": str(p)}
-        except (OSError, ValueError):
-            return None
+        return p
     return None
+
+
+def _codex_user_text(r):
+    """Text of a user turn in a rollout line, else None (context wrappers like <environment_context> skipped)."""
+    pl = r.get("payload") if isinstance(r, dict) else None
+    if not isinstance(pl, dict):
+        return None
+    if r.get("type") == "response_item" and pl.get("type") == "message" and pl.get("role") == "user":
+        text = " ".join(c.get("text", "") for c in (pl.get("content") or []) if isinstance(c, dict) and c.get("type") == "input_text")
+    elif r.get("type") == "event_msg" and pl.get("type") == "user_message":
+        text = pl.get("message") if isinstance(pl.get("message"), str) else ""
+    else:
+        return None
+    text = text.strip()
+    return text if text and not text.startswith("<") else None
+
+
+def codex_info(tid, cache=None):
+    """Rollout head + tail seeks only: session_meta (cwd, subagent?, parent), first user turn (title),
+    last user turn, last task_complete (assistant). Same shape as transcript_info; cached by (mtime, size)."""
+    path = codex_rollout(tid)
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = str(path)
+    c = cache.get(key) if cache is not None else None
+    if c and c.get("mtime") == st.st_mtime and c.get("size") == st.st_size:
+        return c
+    info = {"mtime": st.st_mtime, "size": st.st_size, "path": key, "title": "", "custom_title": "", "first_prompt": "",
+            "forked_from": None, "last_prompt": "", "last_assistant": "", "cwd": "", "started": st.st_mtime,
+            "summary_title": "", "subagents": 0, "subagent": False}
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256 * 1024).decode("utf-8", "replace")
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 256 * 1024))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    head_lines = head.split("\n")
+    try:
+        meta = json.loads(head_lines[0])
+        pl = meta.get("payload") if isinstance(meta, dict) and isinstance(meta.get("payload"), dict) else {}
+    except ValueError:
+        pl = {}
+    info["cwd"] = pl.get("cwd") if isinstance(pl.get("cwd"), str) else ""
+    src = pl.get("source")
+    info["subagent"] = pl.get("thread_source") == "subagent" or (isinstance(src, dict) and "subagent" in src)
+    par = pl.get("parent_thread_id")
+    info["forked_from"] = par if (isinstance(par, str) and UUID_RE.fullmatch(par) and not info["subagent"]) else None
+    if isinstance(pl.get("timestamp"), str):
+        try:
+            info["started"] = datetime.fromisoformat(pl["timestamp"].replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    for line in head_lines[1:]:
+        try:
+            text = _codex_user_text(json.loads(line))
+        except ValueError:
+            continue
+        if text:
+            info["first_prompt"] = text
+            break
+    for line in reversed(tail.split("\n")[1:]):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        pl = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        if not info["last_assistant"] and r.get("type") == "event_msg" and pl.get("type") == "task_complete" \
+                and isinstance(pl.get("last_agent_message"), str):
+            info["last_assistant"] = pl["last_agent_message"].strip()
+        if not info["last_prompt"]:
+            text = _codex_user_text(r)
+            if text:
+                info["last_prompt"] = text
+        if info["last_prompt"] and info["last_assistant"]:
+            break
+    if cache is not None:
+        cache[key] = info
+    return info
+
+
+def codex_index():
+    """~/.codex/session_index.jsonl → {thread id: name} (codex names a thread after its first turn; newest wins)."""
+    out = {}
+    for line in read(CODEX_DIR / "session_index.jsonl").split("\n"):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and isinstance(r.get("id"), str) and isinstance(r.get("thread_name"), str) and r["thread_name"].strip():
+            out[r["id"]] = r["thread_name"].strip()
+    return out
+
+
+def recent_codex_threads(since, cache):
+    """Thread ids whose rollout changed since `since`, subagent threads excluded (codex has no hook, so
+    this is what puts closed codex threads into the backlog)."""
+    root = CODEX_DIR / "sessions"
+    if not root.is_dir():
+        return []
+    out = []
+    d = datetime.fromtimestamp(since).date()
+    end = datetime.fromtimestamp(now_ts()).date()
+    while d <= end:
+        for p in (root / f"{d.year:04d}/{d.month:02d}/{d.day:02d}").glob("rollout-*.jsonl"):
+            m = UUID_RE.search(p.name)
+            if not m or (mtime(p) or 0) < since:
+                continue
+            ci = codex_info(m.group(0), cache)
+            if ci and not ci["subagent"]:
+                out.append(m.group(0))
+        d += timedelta(days=1)
+    return out
+
+
+def codex_title(rec, ci, names):
+    return (names.get(rec["sid"]) or rec.get("title") or clean((ci or {}).get("first_prompt", ""), TITLE_MAX)
+            or f"codex {rec['sid'][:8]}")
 
 
 # ----------------------------------------------------------------------------- live status
@@ -528,6 +650,8 @@ def build_model(now=None):
                     rec["placements"].append((wi, ti, len(tab["surfaces"]) - 1))
                     if p.get("label") and not rec["title"]:
                         rec["title"] = clean(ICON_RE.sub("", p["label"]))
+                    if kind == "codex" and p.get("state") in ("ask", "busy"):
+                        rec["status"] = p["state"]              # from the codex TUI's terminal title (this tick)
                     if alive:
                         rec["proc_start"] = proc_start(ppid)
                         if kind == "claude":
@@ -545,6 +669,9 @@ def build_model(now=None):
         session(sid, ev["kind"])
     for sid in recent_transcripts(now - DECAY_DAYS * DAY):
         session(sid, "claude")
+    for sid in recent_codex_threads(now - DECAY_DAYS * DAY, cache):
+        session(sid, "codex")
+    codex_names = codex_index()
     done_closed = {sid: ev for sid, ev in last.items() if ev["state"] == "done" and sid not in sessions}
 
     def finish(rec, ev):
@@ -585,17 +712,20 @@ def build_model(now=None):
             st, since = live_status(sid) if rec["placements"] else (None, None)
             rec["status"], rec["status_since"] = st, since
         else:
-            ci = codex_info(sid)
+            ci = codex_info(sid, cache)
             rec["info"] = ci
             rec["mtime"] = ci["mtime"] if ci else 0
-            rec["title"] = rec["title"] or f"codex {sid[:8]}"
+            rec["title"] = codex_title(rec, ci, codex_names)
         finish(rec, last.get(sid))
 
     for sid, ev in done_closed.items():
         rec = {"sid": sid, "kind": ev["kind"], "title": "", "status": None, "status_since": None, "placements": [],
                "mtime": 0, "info": None, "proc_start": None, "argv_parent": None, "hidden": True}
-        info = transcript_info(transcript_path(sid), cache)
-        if info:
+        info = codex_info(sid, cache) if ev["kind"] == "codex" else transcript_info(transcript_path(sid), cache)
+        if info and ev["kind"] == "codex":
+            rec["info"], rec["mtime"] = info, info["mtime"]
+            rec["title"] = codex_title(rec, info, codex_names)
+        elif info:
             rec["info"], rec["mtime"] = info, info["mtime"]
             rec["title"] = info.get("custom_title") or info.get("title") or info.get("summary_title") or clean(info.get("first_prompt", ""), TITLE_MAX)
         rec["title"] = rec["title"] or sid[:8]
@@ -654,7 +784,8 @@ def status_slot(rec, surf_kind=None, backlog=False):
     if backlog:
         return "🟢" if rec and rec.get("due") else "  "
     if surf_kind == "codex" or (rec and rec["kind"] == "codex"):
-        return CODEX_SLOT
+        st = (rec or {}).get("status")
+        return ICON[st] if st in ("ask", "busy") else CODEX_SLOT      # ask/busy: from the codex terminal title
     return ICON.get((rec or {}).get("status") or "idle", "⚪")
 
 
@@ -797,7 +928,7 @@ def detail_lines(rec, model, w):
         cwd = (info.get("cwd") or "").replace(str(HOME), "~")
         l2 = fit(f" {lead} · {rec['sid'][:8]}" + (f" · {cwd}" if cwd else ""), w)
     you = wrap_words("you    ", info.get("last_prompt") or "—", w - 1, 2)
-    cl = wrap_words("claude ", info.get("last_assistant") or "—", w - 1, 2)
+    cl = wrap_words("codex  " if rec["kind"] == "codex" else "claude ", info.get("last_assistant") or "—", w - 1, 2)
     return ["═" * w, l1, l2] + [" " + l for l in you] + [" " + l for l in cl]
 
 
@@ -1394,6 +1525,18 @@ GS_INSERTS = [
      '                items.append((s.get("dir") or "right", p))\n'),
     ('    if any(a in ("-h", "--help") for a in rest):\n        print(__doc__)\n        return 0\n',
      '    if cmd == "save":\n'),
+    # codex thread names (20 Oct 2026): index, title parsing, resolution in save()
+    # codex thread names (20 Oct 2026)
+    ('CODEX_INDEX = Path(os.environ.get("GHOSTTY_SESSION_CODEX_DIR") or HOME / ".codex") / "session_index.jsonl"   # named threads\n',
+     'UUID_RE = re.compile('),
+    ('# ----------------------------------------------------------------------------- codex\n# The codex TUI shows its thread only in the terminal title it sets (default items: run state + project):\n# "[ ! ] Action Required | <thread name> | <project>", "⠋ <thread name> | <project>", "<project>" (unnamed).\nCODEX_STATE_RE = re.compile(r"^\\[ [!.] \\] Action Required$")\n\n\ndef codex_title_parts(title):\n    """{"name", "id", "state"} (state: ask / busy / None) when the title is a codex one, else None."""\n    t = strip_icon(title)\n    if not t:\n        return None\n    state, keep = None, []\n    for seg in (x.strip() for x in t.split(" | ")):\n        if CODEX_STATE_RE.match(seg):\n            state = "ask"\n            continue\n        if seg and "\\u2800" <= seg[0] <= "\\u28ff":        # braille spinner frame\n            state, seg = "busy", seg[1:].strip()\n            if not seg:\n                continue\n        keep.append(seg)\n    if len(keep) < 2 and state is None:\n        return None\n    name = " | ".join(keep[:-1]) if len(keep) >= 2 else None\n    return {"name": name, "id": name if name and UUID_RE.fullmatch(name) else None, "state": state}\n\n\ndef codex_index():\n    """~/.codex/session_index.jsonl → [{id, name, updated}] (codex names a thread after its first turn)."""\n    out = []\n    for line in read(CODEX_INDEX).split("\\n"):\n        try:\n            r = json.loads(line)\n        except ValueError:\n            continue\n        if isinstance(r, dict) and isinstance(r.get("id"), str) and UUID_RE.fullmatch(r["id"]):\n            out.append({"id": r["id"], "name": str(r.get("thread_name") or ""), "updated": str(r.get("updated_at") or "")})\n    return out\n\n\ndef uuid7_time(tid):\n    """codex thread ids are UUIDv7: the first 48 bits are unix milliseconds."""\n    try:\n        return int(tid[:8] + tid[9:13], 16) / 1000\n    except ValueError:\n        return None\n\n\ndef codex_resolve(windows, surfaces, reg_s, known):\n    """Codex panes: a tab whose title parses as a codex title names its codex pane (label = thread name,\n    id = newest thread of that name in the index, state ask/busy for this tick). A tab with several codex\n    panes only names the one whose label already matches. A pane still without an id takes the named thread\n    created right after its process started (the TUI creates its thread at startup): each such thread goes\n    to the latest-started pane before it, each pane takes the earliest thread it was given.\n    Resolved id + label are kept in reg["codex"] while the pane lives."""\n    cxs = [s for s in surfaces if s["program"].get("kind") == "codex"]\n    if not cxs:\n        return\n    index = codex_index()\n    names = {r["id"]: r["name"] for r in index if r["name"]}\n    for s in cxs:\n        s["program"].pop("state", None)\n        if s["program"].get("id") in names:              # the index is the source of names once the id is known\n            s["program"]["label"] = names[s["program"]["id"]]\n    for w in windows:\n        for t in w["tabs"]:\n            cx = [s for s in cxs if reg_s.get(skey(s), {}).get("tab") == t["id"]]\n            parts = codex_title_parts(t.get("title")) if cx else None\n            if not parts:\n                continue\n            if len(cx) == 1:\n                tgt = cx[0]\n            else:\n                named = [s for s in cx if parts["name"] and s["program"].get("label") == parts["name"]]\n                tgt = named[0] if len(named) == 1 else None\n            if tgt is None:\n                continue\n            p = tgt["program"]\n            if parts["name"] and p.get("id") in names and names[p["id"]] != parts["name"]:\n                continue                                  # that title belongs to another thread: misfiled slot\n            if parts["state"]:\n                p["state"] = parts["state"]\n            if parts["name"] and not p.get("label"):\n                p["label"] = parts["name"]\n            if not p.get("id") and parts["name"]:\n                taken = {x["program"].get("id") for x in cxs}\n                if parts["id"] and parts["id"] not in taken:\n                    p["id"] = parts["id"]\n                else:\n                    same = [r for r in index if r["name"] == parts["name"] and r["id"] not in taken]\n                    if same:\n                        p["id"] = max(same, key=lambda r: r["updated"])["id"]\n    todo = [s for s in cxs if not s["program"].get("id")]\n    if todo:\n        taken = {s["program"].get("id") for s in cxs}\n        votes = {}                                   # pane key → candidate threads\n        for r in index:\n            t = uuid7_time(r["id"])\n            if r["id"] in taken or t is None:\n                continue\n            near = [s for s in todo if -5 <= t - s["start"] <= 30]\n            if near:\n                votes.setdefault(skey(max(near, key=lambda s: s["start"])), []).append(r)\n        for s in todo:\n            c = votes.get(skey(s), [])\n            if c:\n                r = min(c, key=lambda r: uuid7_time(r["id"]))\n                s["program"]["id"] = r["id"]\n                s["program"]["label"] = s["program"].get("label") or r["name"] or None\n    for s in cxs:\n        p = s["program"]\n        if p.get("id") in names:\n            p["label"] = names[p["id"]]\n        if p.get("id") or p.get("label"):\n            known[skey(s)] = {"id": p.get("id"), "label": p.get("label")}\n\n\n',
+     'def live_surfaces():\n'),
+    ('    if k == "codex":\n        return p.get("label") or None\n',
+     '    if k == "shell":\n        if p.get("label"):\n'),
+    ('    known = reg.setdefault("codex", {})          # codex pane key → {id, label} resolved on an earlier tick\n    for k in list(known):\n        if k not in live:\n            del known[k]\n    for k, v in known.items():\n        p = live[k]["program"]\n        if p.get("kind") == "codex":\n            p["id"] = p.get("id") or v.get("id")\n            p["label"] = v.get("label") or p.get("label")\n',
+     '    prev = load_json(CUR, {})\n    record_closed_windows(reg, live, prev, now)\n'),
+    ('    codex_resolve(windows, surfaces, reg_s, known)\n',
+     '    reg["windows"] = windows\n    reg["a11y"] = a11y_ok\n'),
 ]
 GS_REPLACES = [
     # split_dir: `left` only for the sidebar (kind sessions); every other pane classifies exactly as before
@@ -1411,6 +1554,21 @@ GS_REPLACES = [
      'arrow = {"right": "→", "down": "↓", "left": "←"}.get(s.get("dir")) or "•"'),
     (['    if cmd == "save":\n        with lock():\n'],
      '    if cmd == "save":\n        if rest:\n            print("save takes no arguments", file=sys.stderr)\n            return 2\n        with lock():\n'),
+    # codex: titles for anchored tabs, names from the index, describe
+    (['    shell → bash\'s "⚪ \\\\w" / "🚧 <cmd>" (see ~/.bashrc). codex/tmux: unknown."""\n'],
+     '    shell → bash\'s "⚪ \\\\w" / "🚧 <cmd>" (see ~/.bashrc), codex → thread name (see codex_resolve). tmux: unknown."""\n'),
+    (['            cands = [k for k in by_key if k not in assigned and titles.get(k) == want]\n'],
+     '            cands = [k for k in by_key if k not in assigned and titles.get(k) and\n                     (titles[k] == want or (by_key[k]["program"].get("kind") == "codex" and\n                                            titles[k] == (codex_title_parts(want) or {}).get("name")))]\n'),
+    (['                windows[wi]["tabs"][si] = {"id": old_tab, "title": ""}\n                moved[old_tab] = old_tab\n'],
+     '                windows[wi]["tabs"][si] = {"id": old_tab, "title": "", "anchored": True}\n                moved[old_tab] = old_tab\n'),
+    (['        tid = new_tab(wi, si) if windows[wi]["tabs"][si] is None else windows[wi]["tabs"][si]["id"]\n        reg_s[k] = {"tab": tid, "kind": "tab", "dir": None, "seq": v["seq"] if v else reg["seq"]}\n'],
+     '        tid = new_tab(wi, si) if windows[wi]["tabs"][si] is None else windows[wi]["tabs"][si]["id"]\n        windows[wi]["tabs"][si]["anchored"] = True\n        reg_s[k] = {"tab": tid, "kind": "tab", "dir": None, "seq": v["seq"] if v else reg["seq"]}\n'),
+    (['    # finalize: drop unfilled slots, copy titles from the tab bar\n'],
+     '    # finalize: drop unfilled slots, copy titles from the tab bar (all of them when the counts agree, else\n    # only tabs that were anchored by their title; the position of the rest is a guess)\n'),
+    (['            if si < len(slot_titles) and len(w["tabs"]) == len(slot_titles):\n                t["title"] = slot_titles[si]\n            tabs.append(t)\n'],
+     '            if si < len(slot_titles) and (len(w["tabs"]) == len(slot_titles) or t.pop("anchored", False)):\n                t["title"] = slot_titles[si]\n            t.pop("anchored", None)\n            tabs.append(t)\n'),
+    (['        return f"codex {p.get(\'id\') or \'?\'}  ({cwd})"\n'],
+     '        return f"codex {p.get(\'id\') or \'?\'}  {p.get(\'label\') or \'\'}  ({cwd})".rstrip()\n'),
 ]
 
 
