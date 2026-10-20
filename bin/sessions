@@ -886,21 +886,35 @@ def sweep_count(rows):
     return sum(1 for r in rows if r.get("sweep"))
 
 
+KEYS = [" ↵ open  r resume  p pin  s snooze  x done  a active",
+        " / filter  ␣ detail  D show done  m more  ? help  q quit"]
+KEYS_MIN_ROWS = 20          # the cheatsheet needs the room; short or narrow terminals keep just the footer line
+KEYS_MIN_COLS = max(width(k) for k in KEYS)
+
+
+def keys_lines(w):
+    """Blank line, titled rule, the two key lines: the cheatsheet that sits above the footer."""
+    head = "══ keys "
+    return ["", head + "═" * max(0, w - width(head))] + [fit(k, w) for k in KEYS]
+
+
 def render(model, rows, w=56, cursor=None, footer_msg=None, detail=None, height=None):
     w = max(40, w)
     lines = [render_row(r, w, cursor is not None and i == cursor) for i, r in enumerate(rows)]
     default_footer = f" c 🧹 {sweep_count(rows)}" if model.get("fresh", True) else " snapshot stale"
     footer = pad_line(footer_msg if footer_msg is not None else default_footer, "?", w)
+    keys = keys_lines(w) if (height is None or height >= KEYS_MIN_ROWS) and w >= KEYS_MIN_COLS else []
+    footer = keys + [footer]
     body = lines
     if height:
-        avail = max(0, height - 1 - (len(detail) if detail else 0))
+        avail = max(0, height - len(footer) - (len(detail) if detail else 0))
         if cursor is not None and len(body) > avail:
             top = max(0, min(cursor - avail // 2, len(body) - avail))
             body = body[top:top + avail]
         else:
             body = body[:avail]
         body = body + [""] * (avail - len(body))
-    return body + (detail or []) + [footer]
+    return body + (detail or []) + footer
 
 
 def detail_lines(rec, model, w):

@@ -179,6 +179,10 @@ EXPECTED = """\
        someday item t
        someday item u
 ════════════════════════════════════════════════════════
+
+══ keys ════════════════════════════════════════════════
+ ↵ open  r resume  p pin  s snooze  x done  a active
+ / filter  ␣ detail  D show done  m more  ? help  q quit
  c 🧹 5                                                ?"""
 
 
@@ -243,7 +247,7 @@ try:
         over = [l for l in lines if cells(l) > w]
         right = [l for l in lines[:-1] if re.search(r"(\s\d+[dmh]|\s\?\d+d|\s🧹( \S+)?|\s—)$", l)]
         bad = [l for l in right if cells(l) != w]
-        check(f"width {w}: no overflow, right column aligned", rc == 0 and not over and not bad and len(lines) == len(EXPECTED.splitlines()),
+        check(f"width {w}: no overflow, right column aligned", rc == 0 and not over and not bad and len(lines) == len(EXPECTED.splitlines()) - (4 if w < 56 else 0),
               f"over={over[:3]} bad={bad[:3]} n={len(lines)}\n{out}")
 
     # 3. ledger round trip (scratch state)
@@ -642,11 +646,12 @@ try:
     check("pty: m toggles backlog expansion (no +N either way here)", "someday item u" in scr and not re.search(r"═\+\d", scr), scr[-300:])
     send(fdm, b"m")
     scr = strip_ansi(send(fdm, b" ", 0.6))
-    check("pty: space opens the 7-row detail pane", scr.count("═" * 56) == 2 and re.search(r"^ you    \S", scr, re.M) and re.search(r"^ claude \S", scr, re.M), scr)
+    check("pty: space opens the 7-row detail pane (above the keys block)", scr.count("═" * 56) >= 1 and re.search(r"^ you    \S", scr, re.M) and re.search(r"^ claude \S", scr, re.M)
+          and scr.index("claude ") < scr.index("══ keys "), scr)
     fcntl.ioctl(fdm, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 56, 0, 0))
     os.kill(pid, signal.SIGWINCH)
     scr = strip_ansi(send(fdm, b"", 0.8))
-    check("pty: SIGWINCH to 12 rows drops the detail pane", "═" * 56 not in scr and "══ window 1 " in scr, scr)
+    check("pty: SIGWINCH to 12 rows drops the detail pane and the keys block", "═" * 56 not in scr and "══ keys " not in scr and "══ window 1 " in scr, scr)
     fcntl.ioctl(fdm, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 56, 0, 0))
     os.kill(pid, signal.SIGWINCH)
     send(fdm, b" ")

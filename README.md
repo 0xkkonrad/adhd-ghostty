@@ -33,6 +33,10 @@ unit of account:
        Bitwarden shadow vault                        ?1d
        Competitor UK incorporation
 ══════════════════════════════════════════════════════+7
+
+══ keys ════════════════════════════════════════════════
+ ↵ open  r resume  p pin  s snooze  x done  a active
+ / filter  ␣ detail  D show done  m more  ? help  q quit
  c 🧹 5                                                ?
 ```
 
@@ -45,6 +49,7 @@ unit of account:
   they have waited), `Nd` = parked, wakes in N days, `?Nd` = unsorted, auto-archived in N days,
   🧹 = still holds a tab, `c` closes it (`🧹 📌` = pinned session whose tab can go).
 - `══ history ══`: sessions with no tab anywhere (cap 40, `m` shows all). `0d` + 🟢 = due today.
+- `══ keys ══`: the cheatsheet, always at the bottom (hidden under 20 rows or 56 columns); `?` shows the legend.
 
 ## Shortcuts
 
