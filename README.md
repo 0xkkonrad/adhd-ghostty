@@ -7,10 +7,6 @@ The centre piece is `sessions`, a 56-column sidebar that treats the **session** 
 unit of account:
 
 ```
-══ 📌 pinned ═══════════════════════════════════════════
-📌 🟢 Lisbon Sailing Research                         2h
-📌    Referral v3 success metric                      5d
-
 ══ window 1 ════════════════════════════════════════════
  ├1 ⚪ LP Refresh Competitor                          🧹
  ├2 🚧 Design system landing page
@@ -25,6 +21,10 @@ unit of account:
 ══ window 2 ════════════════════════════════════════════
  └1 🔴 Welecja Drive Migration                       40m
 
+══ 📌 pinned ═══════════════════════════════════════════
+📌 🟢 Lisbon Sailing Research                         2h
+📌    Referral v3 success metric                      5d
+
 ══ history ═════════════════════════════════════════════
     🟢 Welecja member explainer                       0d
     🟢 Split payment check                            0d
@@ -36,7 +36,8 @@ unit of account:
  c 🧹 5                                                ?
 ```
 
-- `══ 📌 pinned ══`: sessions kept for later (no date, never decays), newest activity first, age on the right.
+- `══ 📌 pinned ══`: sessions kept for later (no date, never decays), between the windows and the history,
+  newest activity first, age on the right.
 - `══ window N ══`, `├N` tab N (= Ghostty `alt+N`), `├─` split, `└⑂` split forked from its parent.
 - Left emoji = live status from the Claude Code hook: ⚪ idle, 🚧 working, 🟢 finished (your turn), 🔴 blocked on you.
   Codex rows show `▫`, or 🚧 / 🔴 when the codex TUI's terminal title says so (spinner / `Action Required`).
@@ -54,7 +55,7 @@ Sidebar keys (cursor moves over session rows only):
 | `j` / `k`, `↑` / `↓` | move |
 | `↵` | open row: focus hint `→ "window title" · alt+N`; closed row: resume in a new tab |
 | `r` | resume in a new tab (closed rows; on an open row same as `↵`) |
-| `p` | pin / unpin (📌 section at the top, no date, never decays) |
+| `p` | pin / unpin (📌 section above the history, no date, never decays) |
 | `s` | snooze = park: days (number, `s` = someday), then a note |
 | `c` | close = sweep every visible 🧹 pane (confirms above 3) |
 | `x` | done (hidden; `D` shows) |
@@ -75,7 +76,8 @@ In a Claude Code session:
 | `/done` | mark done |
 | `/fork-here [down]` | fork this session into a new split |
 
-Typing in a parked session re-activates it; typing in a pinned session keeps it pinned.
+Typing in a parked session re-activates it. A pinned session stays pinned through typing, closing its tab
+and resuming it; only `p`, `/pin`, `x` or `/done` change that.
 
 ## Layout
 
@@ -88,7 +90,7 @@ Typing in a parked session re-activates it; typing in a pinned session keeps it 
 | `hooks/tab-status.py` | Claude Code hook: status icon + short title in the tab, `.state` files the sidebar reads |
 | `skills/` | `/park`, `/pin`, `/done`, `/fork-here` for Claude Code |
 | `shell/bashrc-snippet.sh` | the `~/.bashrc` block that lets a fresh split pick up its command |
-| `tests/run_tests.py` | 101 checks: render, ledger, sweep with real processes, pty keys, install idempotency |
+| `tests/run_tests.py` | 102 checks: render, ledger, sweep with real processes, pty keys, install idempotency |
 | `docs/` | `sessions.md` (operate, reset, limits), `sessions-spec.md` (the agreed design), ghostty-session and tab-status notes |
 
 ## Install

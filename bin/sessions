@@ -795,12 +795,6 @@ def build_rows(model, show_done=False, expand=False, filt=""):
     rows = []
     pinned = sorted((r for r in S.values() if r["state"] == "pinned" and (not f or f in r["title"].lower())),
                     key=lambda r: (-r["last_activity"], r["title"]))
-    for r in pinned:
-        rows.append({"kind": "pinned", "slot": status_slot(r) if r["open"] else "  ", "title": r["title"],
-                     "right": right_text(r, now, False), "sid": r["sid"], "rec": r, "surf": None, "sweep": False})
-    if pinned:
-        rows.insert(0, {"kind": "rule", "title": "📌 pinned", "sid": None})
-        rows.append({"kind": "blank", "sid": None})
     for w in model["windows"]:
         tabs = w["tabs"]
         if not tabs:                      # window with only shell/tmux panes: nothing to show
@@ -833,6 +827,12 @@ def build_rows(model, show_done=False, expand=False, filt=""):
                              "rec": rec, "sweep": sweepable(rec), "win": w["n"], "tab": t["n"], "last_tab": last_tab,
                              "win_title": w["title"]})
                 seen.append(s["sid"])
+    if pinned:                        # between the windows and the history
+        rows.append({"kind": "blank", "sid": None})
+        rows.append({"kind": "rule", "title": "📌 pinned", "sid": None})
+        for r in pinned:
+            rows.append({"kind": "pinned", "slot": status_slot(r) if r["open"] else "  ", "title": r["title"],
+                         "right": right_text(r, now, False), "sid": r["sid"], "rec": r, "surf": None, "sweep": False})
     rows.append({"kind": "blank", "sid": None})
     rows.append({"kind": "rule", "title": "history", "sid": None})
     back = [r for r in S.values() if not r["open"] and (r["state"] in ("parked", "unsorted") or (show_done and r["state"] == "done"))]
@@ -972,10 +972,20 @@ def new_tab_with(cmd):
     return False, "no new shell picked the command up within 6 s"
 
 
+def mark_active(sid, kind, src, throttle=0):
+    """Activity (a prompt, a resume): active — but a pinned session stays pinned until unpinned explicitly;
+    only its activity time moves. Returns the event, or None when throttled."""
+    last = ledger_last().get(sid)
+    keep = "pinned" if last and last["state"] == "pinned" else "active"
+    if throttle and last and last["state"] == keep and now_ts() - last["ts"] < throttle:
+        return None
+    return ledger_append(sid, keep, kind, src=src)
+
+
 def do_resume(rec):
     ok, msg = new_tab_with(resume_command(rec))
     if ok:
-        ledger_append(rec["sid"], "active", rec["kind"], src="tui")
+        mark_active(rec["sid"], rec["kind"], "tui")
     return ok, msg
 
 
@@ -1113,7 +1123,7 @@ HELP = [
     "═══ keys ═══",
     " j/k ↑↓  move        ↵  focus hint / resume",
     " r  resume (closed)   s  snooze (park): days or s, note",
-    " p  pin / unpin (📌 section at the top, never decays)",
+    " p  pin / unpin (📌 section above the history, never decays)",
     " x  done     a  activate     c  close 🧹 panes (sweep)",
     " /  filter   Esc clear   space  detail pane",
     " D  show done   m  whole backlog   q  quit",
@@ -1616,7 +1626,7 @@ Run exactly this, with no other steps first (it toggles):
 sessions pin "$CLAUDE_CODE_SESSION_ID" --toggle
 ```
 
-Reply with one line: pinned (kept at the top of the sidebar until unpinned) or unpinned. If it fails, show the error verbatim.
+Reply with one line: pinned (kept in the sidebar's 📌 section, above the history, until unpinned) or unpinned. If it fails, show the error verbatim.
 '''
 
 
@@ -1747,11 +1757,7 @@ def main(argv):
             print(f"done {sid[:8]}")
             return 0
         if cmd == "touch":
-            last = ledger_last().get(sid)
-            keep = "pinned" if last and last["state"] == "pinned" else "active"   # typing never unpins
-            if last and last["state"] == keep and now_ts() - last["ts"] < 600:
-                return 0          # throttle: one event per 10 min
-            ledger_append(sid, keep, kind, src="hook")
+            mark_active(sid, kind, "hook", throttle=600)       # typing never unpins; one event per 10 min
             return 0
         if cmd in ("pin", "unpin"):
             last = ledger_last().get(sid)

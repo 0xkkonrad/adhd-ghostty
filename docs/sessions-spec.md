@@ -87,10 +87,6 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
 
 ## TUI rendering — the agreed mockup (56 cols; width = split width, min 40; pinned + titled rules 19 Oct)
 ```
-══ 📌 pinned ═══════════════════════════════════════════
-📌 🟢 Lisbon Sailing Research                         2h
-📌    Referral v3 success metric                      5d
-
 ══ window 1 ════════════════════════════════════════════
  ├1 ⚪ LP Refresh Competitor                          🧹
  ├2 🚧 Design system landing page
@@ -104,6 +100,10 @@ Design was agreed in chat on 19 Oct 2026 (session 52cc6a02). This file is the br
 ▶└7 🚧 Multi-Session Dashboard
 ══ window 2 ════════════════════════════════════════════
  └1 🔴 Welecja Drive Migration                       40m
+
+══ 📌 pinned ═══════════════════════════════════════════
+📌 🟢 Lisbon Sailing Research                         2h
+📌    Referral v3 success metric                      5d
 
 ══ history ═════════════════════════════════════════════
     🟢 Welecja member explainer                       0d

@@ -6,10 +6,6 @@ Tool: `~/.local/bin/sessions` (python3 stdlib, one file, no root). Tests: `sessi
 
 ## What it shows (56-col left split)
 ```
-══ 📌 pinned ═══════════════════════════════════════════   pinned: keep for later, no date, never decays (omitted when empty)
-📌 🟢 Lisbon Sailing Research                         2h   open pinned session: live status; right = age since last activity
-📌    Referral v3 success metric                      5d   closed pinned session
-                                                           (blank line)
 ══ window 1 ════════════════════════════════════════════   Ghostty window 1 (registry order)
  ├1 ⚪ LP Refresh Competitor                          🧹   ├N = tab N (alt+N in that window)
  ├3 ⚪ Shotgun split tree review                  🧹 ?2d   stale while open: archived in 2d, closable
@@ -17,6 +13,10 @@ Tool: `~/.local/bin/sessions` (python3 stdlib, one file, no root). Tests: `sessi
  │ └⑂ 🟢 Projecting WAU growth                        1h   split forked from the tab's session; 🟢 waiting 1h
  ├5 🟢 Lisbon Sailing Research                     🧹 📌   pinned and still open: the tab can be closed
  └7 🚧 Multi-Session Dashboard                             active: blank right column
+                                                           (blank line)
+══ 📌 pinned ═══════════════════════════════════════════   pinned: keep for later, no date, never decays (omitted when empty)
+📌 🟢 Lisbon Sailing Research                         2h   open pinned session: live status; right = age since last activity
+📌    Referral v3 success metric                      5d   closed pinned session
                                                            (blank line)
 ══ history ═════════════════════════════════════════════   nothing below has a tab (pinned ones live above)
     🟢 Split payment check                            0d   parked and due today
@@ -43,7 +43,7 @@ Sidebar keys (cursor moves over session rows only):
 | `j` / `k`, `↑` / `↓` | move |
 | `↵` | open row: focus hint `→ "window title" · alt+N`; closed row: resume in a new tab |
 | `r` | resume in a new tab (closed rows; on an open row same as `↵`) |
-| `p` | pin / unpin (📌 section at the top, no date, never decays) |
+| `p` | pin / unpin (📌 section above the history, no date, never decays) |
 | `s` | snooze = park: days (number, `s` = someday), then a note |
 | `c` | close = sweep every visible 🧹 pane (confirms above 3) |
 | `x` | done (hidden; `D` shows) |
@@ -71,8 +71,9 @@ Typing in a parked session re-activates it; typing in a pinned session keeps it 
   appends `{"state":"active","src":"hook"}` (throttled to one line per 10 min).
 - **parked** = snoozed (`s`, `/park [days|s] [note]`): wake = local midnight + N days, or none (someday); due when reached.
 - **pinned** (`p`, `/pin` toggle, `sessions pin|unpin SID`): "keep this for later", no date, never decays, listed
-  at the very top sorted by last activity. Typing in it keeps it pinned (the hook writes a `pinned` line, so only
-  the activity time moves). Unpin → active if open, else unsorted with the 3-day countdown restarting now.
+  in its own section between the windows and the history, sorted by last activity. Typing in it keeps it pinned (the hook writes a `pinned` line, so only
+  the activity time moves); resuming it (`r`/`↵`) keeps it pinned too, and closing its tab changes nothing.
+  Unpin → active if open, else unsorted with the 3-day countdown restarting now.
   Park/pin/done gestures themselves do not count as activity; prompts (hook lines) do.
 - **done** (`x`, `/done`): hidden unless `D`; with a tab still open it shows `🧹` until swept.
 - **stale** (derived): open, not parked/done, idle ≥ `SESSIONS_OPEN_GRACE_DAYS` (1) → `🧹 ?Nd`.
@@ -146,7 +147,7 @@ Uninstall: `cp ~/.claude/hooks/tab-status.py.bak-20261019 ~/.claude/hooks/tab-st
 `cp ~/.local/bin/ghostty-session.bak-20261019 ~/.local/bin/ghostty-session`; `rm -r ~/.claude/skills/park
 ~/.claude/skills/done ~/.local/state/sessions ~/.cache/sessions ~/.local/bin/sessions`.
 Reset intent only: delete `~/.local/state/sessions/events.jsonl` (and `lineage.json`).
-Tests: `python3 -I tests/run_tests.py` (from the repo ~/workspace/adhd-ghostty) — 101 checks, fixtures in a temp dir, real throwaway
+Tests: `python3 -I tests/run_tests.py` (from the repo ~/workspace/adhd-ghostty) — 102 checks, fixtures in a temp dir, real throwaway
 process trees for the sweep checks (including the kill-time snapshot re-check), a pty for keys/SIGWINCH/SIGTERM.
 
 ## Deviations from the spec mockup (also listed at the top of run_tests.py)
@@ -159,7 +160,7 @@ process trees for the sweep checks (including the kill-time snapshot re-check), 
 6. Implicit archive writes no `decay` events (state is derivable).
 7. Detail pane is 7 rows: rule, title · state, note *or* fork/subagents · sid · cwd, you ×2, claude ×2 (no message count).
 8. `r` on an open row = focus hint, same as ↵ (spec: always resume).
-9. Pinned (19 Oct, second pass): `📌` section at the top, titled `══` rules, blank lines, cap 40; keys p pin / s snooze / c close.
+9. Pinned (19 Oct, second pass; moved 20 Oct): `📌` section between the windows and the history, titled `══` rules, blank lines, cap 40; keys p pin / s snooze / c close.
 
 ## Limits
 - Split membership of hidden tabs is ghostty-session's best guess (see ghostty-session.md).

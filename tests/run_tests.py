@@ -12,7 +12,7 @@ MOCKUP CORRECTIONS — every difference between the spec mockup (sessions-spec.m
   4. backlog order: due (wake, then recency: Welecja's transcript is newer than Split's; park/pin/done gestures do
      not count as activity), then wake ascending, then unsorted by recency, then someday by recency.
      Spec listed unsorted by countdown.
-  7. pinned (19 Oct, second pass): two pinned rows at the top (Lisbon = open, shows its live 🟢 and `🧹 📌` in the
+  7. pinned (19 Oct; moved 20 Oct): two pinned rows between the windows and the history (Lisbon = open, shows its live 🟢 and `🧹 📌` in the
      tree; Referral = closed, 5d since last activity), titled `══ … ═` rules (`📌 pinned`, `window N`, `history`),
      blank lines between sections, history cap 40 so no +N here. Keys: p pin, s snooze, c close.
   5. extra rows: "closed with hook active line" (a closed session whose only ledger line is `active` must show
@@ -148,10 +148,6 @@ WINDOWS = [
 (GS / "current.json").write_text(json.dumps(snapshot(WINDOWS)))
 
 EXPECTED = """\
-══ 📌 pinned ═══════════════════════════════════════════
-📌 🟢 Lisbon Sailing Research                         2h
-📌    Referral v3 success metric                      5d
-
 ══ window 1 ════════════════════════════════════════════
  ├1 ⚪ LP Refresh Competitor                          🧹
  ├2 🚧 Design system landing page
@@ -165,6 +161,10 @@ EXPECTED = """\
  └7 🚧 Multi-Session Dashboard
 ══ window 2 ════════════════════════════════════════════
  └1 🔴 Welecja Drive Migration                       40m
+
+══ 📌 pinned ═══════════════════════════════════════════
+📌 🟢 Lisbon Sailing Research                         2h
+📌    Referral v3 success metric                      5d
 
 ══ history ═════════════════════════════════════════════
     🟢 Welecja member explainer                       0d
@@ -287,7 +287,7 @@ try:
     rc, out, _ = run("tui", "--once", "--width", "56")
     body = "\n".join(backlog_lines(out))
     check("pinned sessions absent from the backlog", "Referral v3" not in body and "Lisbon" not in body, body)
-    check("pinned + open → 🧹 📌 in the tree and 🟢 in the section", re.search(r"^ ├5 🟢 Lisbon Sailing Research\s+🧹 📌$", out, re.M) and out.splitlines()[1].startswith("📌 🟢 Lisbon"), out)
+    check("pinned + open → 🧹 📌 in the tree and 🟢 in the section", re.search(r"^ ├5 🟢 Lisbon Sailing Research\s+🧹 📌$", out, re.M) and re.search(r"^📌 🟢 Lisbon", out, re.M), out)
     stp = ROOT / "state-pin"; shutil.copytree(ST, stp)
     run("touch", SIDS["g"], state=stp)
     Sp = json.loads(run("map", "--json", state=stp)[1])["sessions"]
@@ -301,8 +301,9 @@ try:
     check("nothing pinned → no section, no leading blank line", out.startswith("══ window 1 ") and "📌" not in out, out[:120])
     run("pin", SIDS["m"], state=stp)
     rc, out, _ = run("tui", "--once", "--width", "56", state=stp)
-    check("pin CLI → titled section at top with age", out.startswith("══ 📌 pinned ═") and out.splitlines()[1].startswith("📌    Referral v3 success metric")
-          and out.splitlines()[1].endswith("5d") and out.splitlines()[2] == "", out[:200])
+    L = out.splitlines(); pi = next((i for i, l in enumerate(L) if l.startswith("══ 📌 pinned ═")), -1)
+    check("pin CLI → titled section between the windows and the history, with age", pi > 0 and L[0].startswith("══ window 1 ") and L[pi - 1] == ""
+          and L[pi + 1].startswith("📌    Referral v3 success metric") and L[pi + 1].endswith("5d") and L[pi + 2] == "" and L[pi + 3].startswith("══ history "), out[:600])
     rc, out, _ = run("pin", SIDS["m"], "--toggle", state=stp)
     check("pin --toggle on a pinned session unpins", "unpinned" in out, out)
     stc = ROOT / "state-cap"; shutil.copytree(ST, stc)
@@ -547,6 +548,14 @@ try:
     ci = smod.codex_info(CA, {})
     check("codex_info: first/last user turn + last task_complete, wrappers skipped", ci and ci["first_prompt"] == "audit the content for seo trust issues please" and ci["last_prompt"] == "and the footer?" and ci["last_assistant"] == "Footer fixed, three links added." and not ci["subagent"], str(ci))
     check("codex_info: subagent flagged", smod.codex_info(CE, {})["subagent"] is True)
+    # pinned stays pinned through activity: touch (hook) and resume both go through mark_active
+    stq = ROOT / "state-pinned"; stq.mkdir()
+    smod.LEDGER, keep_ledger = stq / "events.jsonl", smod.LEDGER
+    smod.ledger_append(SIDS["m"], "pinned", "claude", src="tui")
+    evq = smod.mark_active(SIDS["m"], "claude", "tui")
+    evt = smod.mark_active(SIDS["n"], "claude", "tui")
+    smod.LEDGER = keep_ledger
+    check("mark_active (resume) keeps a pinned session pinned; a plain one becomes active", evq["state"] == "pinned" and evt["state"] == "active", f"{evq} {evt}")
     rc, out, err = run("touch", CA, state=st8, gs=gs8, extra=cx8)
     ev8 = [json.loads(l) for l in (st8 / "events.jsonl").read_text().split("\n") if l.strip()]
     check("touch on a codex id writes kind codex", rc == 0 and ev8 and ev8[-1]["kind"] == "codex" and ev8[-1]["sid"] == CA, str(ev8))
@@ -584,11 +593,11 @@ try:
     pid, fdm = spawn_tui(st3)
     time.sleep(1.2)
     first = strip_ansi(send(fdm, b"", 0.1))
-    check("pty: first frame, cursor on first selectable row (pinned)", "📌▶🟢 Lisbon Sailing Research" in first, first[:400])
+    check("pty: first frame, cursor on first selectable row (tab 1)", "▶├1 ⚪ LP Refresh Competitor" in first, first[:400])
     scr = strip_ansi(send(fdm, b"k"))
-    check("pty: k at top stays on a selectable row", "📌▶🟢" in scr, scr[:200])
-    send(fdm, b"j"); send(fdm, b"j"); scr = strip_ansi(send(fdm, b"j"))
-    check("pty: j skips the blank + window rows, lands on tab 2", "▶├2" in scr, scr[:400])
+    check("pty: k at top stays on a selectable row", "▶├1" in scr, scr[:200])
+    scr = strip_ansi(send(fdm, b"j"))
+    check("pty: j lands on tab 2", "▶├2" in scr, scr[:400])
     scr = strip_ansi(send(fdm, b"s"))
     check("pty: s opens the snooze (park) prompt", "snooze: days" in scr, scr[-300:])
     scr = strip_ansi(send(fdm, b"\x1b"))
@@ -611,7 +620,8 @@ try:
     n2 = len(ledger3())
     scr = strip_ansi(send(fdm, b"p", 0.8))
     lp = ledger3()[-1]
-    check("pty: p pins the selected row (LP Refresh → 📌 section)", lp["sid"] == SIDS["a"] and lp["state"] == "pinned" and "📌▶⚪ LP Refresh Competitor" in scr, str(lp) + scr[:200])
+    check("pty: p pins the selected row (LP Refresh: 🧹 📌 in the tree, row in the 📌 section, cursor stays)", lp["sid"] == SIDS["a"] and lp["state"] == "pinned"
+          and "▶├1 ⚪ LP Refresh Competitor" in scr and "🧹 📌" in scr and "📌 ⚪ LP Refresh Competitor" in scr, str(lp) + scr[:200])
     scr = strip_ansi(send(fdm, b"p", 0.8))
     lp = ledger3()[-1]
     check("pty: p again unpins (active line)", lp["sid"] == SIDS["a"] and lp["state"] == "active" and len(ledger3()) == n2 + 2, str(lp))
