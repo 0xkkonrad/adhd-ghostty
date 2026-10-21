@@ -4,7 +4,7 @@
 the tab, a backlog of sessions that have no tab, and a sweep that closes tabs of parked/stale ones.
 
   sessions                       open the TUI in a left split of the focused Ghostty window
-  sessions tui [--once] [--width N]   the sidebar (--once: one frame to stdout, for tests)
+  sessions tui [--once] [--width N] [--search TERM]   the sidebar (--once: one frame to stdout, for tests)
   sessions map [--json]          the merged model (placement + status + intent)
   sessions log                   newest first: sid8  age  status  state  where  title
   sessions park SID [--days N | --someday] [--note TEXT]     (skill form: --args "N note…")
@@ -19,7 +19,8 @@ the tab, a backlog of sessions that have no tab, and a sweep that closes tabs of
 Sources: ~/.local/state/ghostty-session/current.json (placement, 20 s), $XDG_RUNTIME_DIR/claude-tab-status
 (live status + titles), ~/.claude/projects/*/<sid>.jsonl (head + tail seeks only; cached by mtime),
 ~/.codex/sessions/*/rollout-*.jsonl (codex threads: head + tail seeks, cached) + ~/.codex/session_index.jsonl
-(thread names; ghostty-session puts the name the codex TUI shows in its terminal title into the snapshot). Ledger: ~/.local/state/sessions/events.jsonl (append-only, last wins).
+(thread names; ghostty-session puts the name the codex TUI shows in its terminal title into the snapshot).
+Search (/ then ↵): grep -l over every transcript and rollout on disk, snippets from the matching user/assistant turns. Ledger: ~/.local/state/sessions/events.jsonl (append-only, last wins).
 Lineage: ~/.local/state/sessions/lineage.json. Cache: ~/.cache/sessions/cache.json.
 Spec: ~/fw16-setup/sessions-spec.md   Docs: ~/fw16-setup/sessions.md
 """
@@ -59,6 +60,7 @@ OPEN_GRACE_DAYS = float(ENV("SESSIONS_OPEN_GRACE_DAYS", "1"))   # open + unmarke
 SWEEP_COMMS = {c.strip() for c in (ENV("SESSIONS_SWEEP_COMMS") or "claude,codex").split(",") if c.strip()}
 SNAPSHOT_MAX_AGE = 60
 BACKLOG_CAP = 40
+FOUND_CAP = 40
 MAX_PARK_DAYS = 3650
 BUS, OBJ = "com.mitchellh.ghostty", "/com/mitchellh/ghostty"
 ICON = {"idle": "⚪", "busy": "🚧", "done": "🟢", "ask": "🔴"}
@@ -68,7 +70,7 @@ TAG_RE = re.compile(r"</?[a-zA-Z_][\w-]*(?:\s[^>]*)?>")
 ICON_RE = re.compile(r"^[\U0001F300-\U0001FAFF☀-➿⬀-⯿️\s]+")
 TITLE_MAX = 48
 DAY = 86400
-SELECTABLE = ("tab", "split", "backlog", "pinned")
+SELECTABLE = ("tab", "split", "backlog", "pinned", "found")
 
 
 def now_ts():
@@ -580,6 +582,156 @@ def codex_title(rec, ci, names):
             or f"codex {rec['sid'][:8]}")
 
 
+# ----------------------------------------------------------------------------- search
+def all_transcripts():
+    """{sid: path} for every Claude transcript on disk (subagent transcripts live deeper and are skipped)."""
+    out = {}
+    for p in (CLAUDE_DIR / "projects").glob("*/*.jsonl"):
+        if UUID_RE.fullmatch(p.stem):
+            out[p.stem] = p
+    return out
+
+
+def all_rollouts():
+    out = {}
+    for p in (CODEX_DIR / "sessions").glob("*/*/*/rollout-*.jsonl"):
+        m = UUID_RE.search(p.name)
+        if m:
+            out[m.group(0)] = p
+    return out
+
+
+def grep_files(term, paths):
+    """Paths whose bytes contain `term` (case-insensitive, fixed string): grep -l, with a Python fallback."""
+    hits, todo = [], [str(p) for p in paths]
+    for i in range(0, len(todo), 400):
+        chunk = todo[i:i + 400]
+        try:
+            r = subprocess.run(["grep", "-l", "-i", "-F", "-a", "--", term, *chunk], capture_output=True, text=True, timeout=120)
+            hits.extend(l for l in r.stdout.split("\n") if l)
+        except (OSError, subprocess.TimeoutExpired):
+            low = term.lower().encode()
+            for f in chunk:
+                try:
+                    with open(f, "rb") as fh:
+                        if low in fh.read().lower():
+                            hits.append(f)
+                except OSError:
+                    pass
+    return hits
+
+
+REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def _turn_text(kind, line):
+    """(rank, text) of a transcript line that is a user (0) or assistant (1) turn, else None."""
+    try:
+        r = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(r, dict):
+        return None
+    if kind == "claude":
+        content = (r.get("message") or {}).get("content")
+        if r.get("type") == "user" and not r.get("isMeta") and not r.get("isCompactSummary"):
+            blocks = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"] \
+                if isinstance(content, list) else [content if isinstance(content, str) else ""]
+            t = " ".join(b.strip() for b in blocks if b.strip() and not b.strip().startswith("<"))   # reminders, wrappers
+            t = REMINDER_RE.sub(" ", t).strip()
+            if t and not t.startswith("/") and not t.startswith("This session is being continued"):
+                return 0, t
+        elif r.get("type") == "assistant":
+            t = _text_of(content).strip()
+            if t:
+                return 1, t
+        return None
+    t = _codex_user_text(r)
+    if t:
+        return 0, t
+    pl = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+    if r.get("type") == "event_msg" and pl.get("type") == "agent_message" and isinstance(pl.get("message"), str) and pl["message"].strip():
+        return 1, pl["message"].strip()
+    if r.get("type") == "response_item" and pl.get("type") == "message" and pl.get("role") == "assistant":
+        t = " ".join(c.get("text", "") for c in (pl.get("content") or []) if isinstance(c, dict) and c.get("type") == "output_text").strip()
+        if t:
+            return 1, t
+    return None
+
+
+def snippet_for(term, kind, path, limit=160):
+    """A stretch of the first user turn (else the first assistant turn) in which `term` occurs; "" when only
+    tool output or metadata matches. The term sits near the start of the snippet."""
+    try:
+        r = subprocess.run(["grep", "-i", "-F", "-a", "-m", "80", "--", term, str(path)], capture_output=True, timeout=60)
+        lines = r.stdout.decode("utf-8", "replace").split("\n")
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    low, best = term.lower(), None
+    for line in lines:
+        if len(line) > 4_000_000:
+            continue
+        got = _turn_text(kind, line)
+        if not got:
+            continue
+        rank, text = got
+        text = clean(text)
+        i = text.lower().find(low)
+        if i < 0:
+            continue
+        if best is None or rank < best[0]:
+            best = (rank, text, i)
+            if rank == 0:
+                break
+    if best is None:
+        return ""
+    _, text, i = best
+    start = max(0, i - 24)
+    if start > 0:
+        sp = text.find(" ", start, i)
+        start = sp + 1 if sp >= 0 else start
+    return ("…" if start > 0 else "") + text[start:start + limit]
+
+
+def deep_search(term, cache=None):
+    """All-time search: every Claude transcript and codex rollout in which `term` (case-insensitive) occurs in a
+    user or assistant turn or in the title, plus codex threads whose index name matches. Matches only in tool
+    output, metadata or injected context (memory, system reminders) do not count. Codex subagent threads are
+    dropped. [{sid, kind, path, mtime, snippet}], newest first."""
+    term = term.strip()
+    if not term:
+        return []
+    cache = {} if cache is None else cache
+    tr, ro = all_transcripts(), all_rollouts()
+    by_path = {str(p): (sid, "claude") for sid, p in tr.items()}
+    by_path.update({str(p): (sid, "codex") for sid, p in ro.items()})
+    hits = {}
+    for p in grep_files(term, list(tr.values()) + list(ro.values())):
+        if p in by_path:
+            sid, kind = by_path[p]
+            hits[sid] = {"sid": sid, "kind": kind, "path": p, "mtime": mtime(Path(p)) or 0}
+    low = term.lower()
+    for sid, name in codex_index().items():
+        if low in name.lower() and sid in ro and sid not in hits:
+            hits[sid] = {"sid": sid, "kind": "codex", "path": str(ro[sid]), "mtime": mtime(ro[sid]) or 0}
+    names = codex_index()
+    out = []
+    for h in hits.values():
+        if h["kind"] == "codex":
+            info = codex_info(h["sid"], cache)
+            if info and info.get("subagent"):
+                continue
+            title = names.get(h["sid"]) or (info or {}).get("first_prompt", "")
+        else:
+            info = transcript_info(Path(h["path"]), cache) or {}
+            title = info.get("custom_title") or info.get("title") or info.get("summary_title") or info.get("first_prompt", "")
+        h["snippet"] = snippet_for(term, h["kind"], h["path"])
+        if h["snippet"] or low in title.lower():
+            out.append(h)
+    out.sort(key=lambda h: -h["mtime"])
+    return out
+
+
 # ----------------------------------------------------------------------------- live status
 def live_status(sid):
     """(state, since) from the tab-status hook; fallback: Claude Code's own session file."""
@@ -607,7 +759,8 @@ def snapshot_fresh(snap, now):
         return False
 
 
-def build_model(now=None):
+def build_model(now=None, extra=None):
+    """extra: {sid: kind} sessions to include whatever their age (search hits)."""
     now = now_ts() if now is None else now
     cache = load_json(CACHE, {})
     if not isinstance(cache, dict):
@@ -671,6 +824,8 @@ def build_model(now=None):
         session(sid, "claude")
     for sid in recent_codex_threads(now - DECAY_DAYS * DAY, cache):
         session(sid, "codex")
+    for sid, kind in (extra or {}).items():
+        session(sid, kind)
     codex_names = codex_index()
     done_closed = {sid: ev for sid, ev in last.items() if ev["state"] == "done" and sid not in sessions}
 
@@ -789,7 +944,9 @@ def status_slot(rec, surf_kind=None, backlog=False):
     return ICON.get((rec or {}).get("status") or "idle", "⚪")
 
 
-def build_rows(model, show_done=False, expand=False, filt=""):
+def build_rows(model, show_done=False, expand=False, filt="", found=None):
+    """found: {"term", "hits"} from deep_search → a `found N` section after the history with every hit not
+    already on screen; a hit whose title does not contain the term shows its › snippet line."""
     now, S = model["now"], model["sessions"]
     f = filt.lower()
     rows = []
@@ -800,6 +957,7 @@ def build_rows(model, show_done=False, expand=False, filt=""):
         if not tabs:                      # window with only shell/tmux panes: nothing to show
             continue
         rows.append({"kind": "rule", "title": f"window {w['n']}", "sid": None})
+        rule_at = len(rows)
         for i, t in enumerate(tabs):
             last_tab = i == len(tabs) - 1
             surfs = t["surfaces"]
@@ -827,6 +985,8 @@ def build_rows(model, show_done=False, expand=False, filt=""):
                              "rec": rec, "sweep": sweepable(rec), "win": w["n"], "tab": t["n"], "last_tab": last_tab,
                              "win_title": w["title"]})
                 seen.append(s["sid"])
+        if f and len(rows) == rule_at:
+            rows.pop()                # filtered window with no matching tab: no bare rule
     if pinned:                        # between the windows and the history
         rows.append({"kind": "blank", "sid": None})
         rows.append({"kind": "rule", "title": "📌 pinned", "sid": None})
@@ -857,14 +1017,32 @@ def build_rows(model, show_done=False, expand=False, filt=""):
         rows.append({"kind": "backlog", "slot": status_slot(r, backlog=True), "title": r["title"],
                      "right": right_text(r, now, False), "sid": r["sid"], "rec": r, "surf": None, "sweep": False})
     rows.append({"kind": "more", "n": len(live_rows) - min(len(live_rows), len(shown) - len(done_rows)), "sid": None})
+    if found is not None:
+        on_screen = {r["sid"] for r in rows if r.get("sid")}
+        hits = [h for h in found.get("hits", []) if h["sid"] in S and h["sid"] not in on_screen]
+        rows.append({"kind": "blank", "sid": None})
+        rows.append({"kind": "rule", "title": f"found {len(hits)}", "sid": None})
+        term = found.get("term", "").lower()
+        for h in (hits if expand else hits[:FOUND_CAP]):
+            r = S[h["sid"]]
+            age = fmt_age(now - r["last_activity"]) if r["last_activity"] else ""
+            rows.append({"kind": "found", "slot": status_slot(r) if r["open"] else "  ", "title": r["title"],
+                         "right": ("📌 " if r["state"] == "pinned" else "") + age, "sid": r["sid"],
+                         "rec": r, "surf": None, "sweep": False})
+            if term and term not in r["title"].lower() and h.get("snippet"):
+                rows.append({"kind": "snippet", "text": h["snippet"], "sid": None})
+        rows.append({"kind": "more", "n": max(0, len(hits) - FOUND_CAP) if not expand else 0, "sid": None})
     return rows
 
 
-def render_row(row, w, cursor=False):
+def render_row(row, w, cursor=False, color=False):
     g = "▶" if cursor else " "
     k = row["kind"]
     if k == "blank":
         return ""
+    if k == "snippet":
+        line = "      › " + fit(row["text"], max(0, w - 8))
+        return (C_DIM + line + C_OFF) if color else line
     if k == "rule":
         head = f"══ {row['title']} "
         return head + "═" * max(0, w - width(head))
@@ -896,30 +1074,38 @@ KEYS_MIN_COLS = 1 + KEYS_COLS * KEYS_CELL
 C_KEY, C_DIM, C_OFF = "\033[1;33m", "\033[2m", "\033[0m"          # key: bold yellow; rule: dim
 
 
-def keys_lines(w, color=False):
+def keys_lines(w, color=False, filt=""):
     """Blank line, titled rule, the keys as a KEYS_COLS-column grid: the cheatsheet above the footer.
-    color=True wraps keys and the rule in ANSI (zero width); the TUI uses it, `--once` does not."""
+    color=True wraps keys and the rule in ANSI (zero width); the TUI uses it, `--once` does not.
+    With a filter active the `/ filter` cell reads `Esc clear`."""
     head = "══ keys "
     rule = head + "═" * max(0, w - width(head))
     out = ["", (C_DIM + rule + C_OFF) if color else rule]
-    for i in range(0, len(KEYS), KEYS_COLS):
+    keys = [("Esc", "clear") if k == "/" and filt else (k, l) for k, l in KEYS]
+    for i in range(0, len(keys), KEYS_COLS):
         line = " "
-        for k, l in KEYS[i:i + KEYS_COLS]:
+        for k, l in keys[i:i + KEYS_COLS]:
             pad = " " * (KEYS_CELL - width(k) - 1 - width(l))
             line += ((C_KEY + k + C_OFF) if color else k) + " " + l + pad
         out.append(line.rstrip())
     return out
 
 
-def render(model, rows, w=56, cursor=None, footer_msg=None, detail=None, height=None, color=False):
+def render(model, rows, w=56, cursor=None, footer_msg=None, detail=None, height=None, color=False, filt=""):
+    """filt: the committed filter / search term; shown in the footer (` /term … c 🧹 N ?`) while active."""
     w = max(40, w)
-    lines = [render_row(r, w, cursor is not None and i == cursor) for i, r in enumerate(rows)]
-    default_footer = f" c 🧹 {sweep_count(rows)}" if model.get("fresh", True) else " snapshot stale"
-    footer = pad_line(footer_msg if footer_msg is not None else default_footer, "?", w)
+    lines = [render_row(r, w, cursor is not None and i == cursor, color) for i, r in enumerate(rows)]
+    count = f"c 🧹 {sweep_count(rows)}" if model.get("fresh", True) else "snapshot stale"
+    if footer_msg is not None:
+        footer = pad_line(footer_msg, "?", w)
+    elif filt:
+        footer = pad_line(fit(f" /{filt}", max(0, w - width(count) - 4)), count + " ?", w)
+    else:
+        footer = pad_line(" " + count, "?", w)
     if color and footer_msg is None and model.get("fresh", True):
-        footer = footer.replace(" c 🧹", f" {C_KEY}c{C_OFF} 🧹", 1)
+        footer = footer.replace("c 🧹", f"{C_KEY}c{C_OFF} 🧹", 1)
         footer = footer[:-1] + C_KEY + "?" + C_OFF
-    keys = keys_lines(w, color) if (height is None or height >= KEYS_MIN_ROWS) and w >= KEYS_MIN_COLS else []
+    keys = keys_lines(w, color, filt) if (height is None or height >= KEYS_MIN_ROWS) and w >= KEYS_MIN_COLS else []
     footer = keys + [footer]
     body = lines
     if height:
@@ -1155,8 +1341,8 @@ HELP = [
     " r  resume (closed)   s  snooze (park): days or s, note",
     " p  pin / unpin (📌 section above the history, never decays)",
     " x  done     a  activate     c  close 🧹 panes (sweep)",
-    " /  filter   Esc clear   space  detail pane",
-    " D  show done   m  whole backlog   q  quit",
+    " /  filter titles · ↵ search every transcript   Esc clear",
+    " D  show done   m  whole backlog   space  detail   q  quit",
     "",
     " ══ N  window   ├N tab (alt+N)   ├─ split   └⑂ fork",
     " ⚪🚧🟢🔴 live  ▫ codex   right: wait age | Nd wake | 📌",
@@ -1189,9 +1375,10 @@ def tui(width_opt=None):
         watcher = Watcher({GHOSTTY_STATE: {"current.json"}, STATE: {"events.jsonl", "lineage.json"},
                            TAB_STATUS: lambda n: n.endswith(".state")})
         state = {"cursor": 0, "show_done": False, "expand": False, "filt": "", "msg": None, "msg_until": 0,
-                 "detail": False, "help": False, "mode": None, "buf": "", "park_days": None, "sel": None}
+                 "detail": False, "help": False, "mode": None, "buf": "", "park_days": None, "sel": None,
+                 "found": None}
         model = build_model()
-        rows = build_rows(model, state["show_done"], state["expand"], state["filt"])
+        rows = build_rows(model, state["show_done"], state["expand"], state["filt"], state["found"])
         last_build, dirty_at = time.time(), None
 
         def selectable_idx(rows_):
@@ -1217,8 +1404,8 @@ def tui(width_opt=None):
 
         def rebuild():
             nonlocal model, rows, last_build
-            model = build_model()
-            rows = build_rows(model, state["show_done"], state["expand"], state["filt"])
+            model = build_model(extra={h["sid"]: h["kind"] for h in (state["found"] or {}).get("hits", [])})
+            rows = build_rows(model, state["show_done"], state["expand"], state["filt"], state["found"])
             last_build = time.time()
             if state["sel"]:
                 for i, rw in enumerate(rows):
@@ -1229,8 +1416,23 @@ def tui(width_opt=None):
 
         def rerows():
             nonlocal rows
-            rows = build_rows(model, state["show_done"], state["expand"], state["filt"])
+            rows = build_rows(model, state["show_done"], state["expand"], state["filt"], state["found"])
             clamp()
+
+        def search(term):
+            """↵ on the filter prompt: the term also goes through every transcript and rollout on disk."""
+            state["filt"] = term
+            if not term:
+                state["found"] = None
+                rebuild()
+                return
+            state["found"] = None
+            rerows()                                   # titles narrow at once; the deep pass follows
+            say("searching…", 30)
+            draw()
+            state["found"] = {"term": term, "hits": deep_search(term, load_json(CACHE, {}))}
+            state["msg"] = None
+            rebuild()
 
         def say(text, secs=3):
             state["msg"], state["msg_until"] = text, time.time() + secs
@@ -1258,7 +1460,7 @@ def tui(width_opt=None):
             if state["help"]:
                 lines = ([fit(h, w) for h in HELP] + [""] * rows_)[:rows_]
             else:
-                lines = render(model, rows, w, state["cursor"], foot, det, rows_, color=True)
+                lines = render(model, rows, w, state["cursor"], foot, det, rows_, color=True, filt=state["filt"])
             out.write("\033[H")
             for i, l in enumerate(lines):
                 out.write("\033[2K" + l + ("\r\n" if i < len(lines) - 1 else ""))
@@ -1283,8 +1485,8 @@ def tui(width_opt=None):
                 elif ch in ("\r", "\n"):
                     b = state["buf"].strip()
                     if m == "filter":
-                        state["filt"], state["mode"], state["buf"] = b, None, ""
-                        rerows()
+                        state["mode"], state["buf"] = None, ""
+                        search(b)
                     elif m == "days":
                         if b == "" or b.isdigit():
                             state["park_days"] = min(int(b or 1), MAX_PARK_DAYS)
@@ -1346,8 +1548,8 @@ def tui(width_opt=None):
             elif ch == "/":
                 state["mode"], state["buf"] = "filter", ""
             elif ch == "\x1b":
-                state["filt"] = ""
-                rerows()
+                state["filt"], state["found"] = "", None
+                rebuild()
             elif ch in ("\r", "\n", "r"):
                 if rec and rec["open"]:
                     say(focus_hint(cur), 4)
@@ -1438,10 +1640,11 @@ def tui(width_opt=None):
 
 
 # ----------------------------------------------------------------------------- subcommands
-def cmd_once(width_opt, show_done=False, expand=False):
-    model = build_model()
-    rows = build_rows(model, show_done, expand)
-    for l in render(model, rows, width_opt or 56):
+def cmd_once(width_opt, show_done=False, expand=False, search=None):
+    found = {"term": search, "hits": deep_search(search)} if search else None
+    model = build_model(extra={h["sid"]: h["kind"] for h in (found or {}).get("hits", [])})
+    rows = build_rows(model, show_done, expand, search or "", found)
+    for l in render(model, rows, width_opt or 56, filt=search or ""):
         print(l.rstrip())
     return 0
 
@@ -1756,7 +1959,14 @@ def main(argv):
                 print("--width needs a number", file=sys.stderr)
                 return 2
         if "--once" in rest:
-            return cmd_once(w, "--done" in rest, "--all" in rest)
+            term = None
+            if "--search" in rest:
+                try:
+                    term = rest[rest.index("--search") + 1]
+                except IndexError:
+                    print("--search needs a term", file=sys.stderr)
+                    return 2
+            return cmd_once(w, "--done" in rest, "--all" in rest, term)
         if not sys.stdin.isatty():
             print("tui needs a terminal (use --once for a single frame)", file=sys.stderr)
             return 2

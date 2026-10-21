@@ -125,6 +125,13 @@ Grammar (no legend on screen; `?` key shows it):
   `history`. The closing rule of history is `═` fill with `+N` right-aligned = hidden rows (cap 40; `m` lifts it).
   One literal empty line after the pinned section and one before history. The pinned section (rule + rows +
   blank) is omitted entirely when nothing is pinned.
+- Search: `/term ↵` adds `══ found N ══` after the history's closing rule (blank line between): the sessions
+  whose user/assistant turns or title contain the term (all-time, grep -l over every transcript and rollout;
+  tool output, memory and system reminders do not count), minus those already on screen, newest first,
+  cap 40 with `+N` (`m` lifts). Row = backlog shape (live emoji when open, `📌 ` before the age when
+  pinned, right column = age). A row whose title misses the term is followed by `      › <passage>`, dim,
+  the term near its start. Footer while a filter is active: ` /term` left, `c 🧹 N ?` right; the keys grid
+  reads `Esc clear` instead of `/ filter`. Filtered windows with no matching tab drop their rule.
 - Pinned rows: `📌` (2 cells) in the tree column, then the 2-cell status slot (live emoji when the session has
   a tab, two spaces otherwise), title; right column = age since last activity (`m`/`h`/`d`); sorted by last
   activity, newest first, no cap. Pinned sessions never appear in history.
@@ -154,7 +161,8 @@ Grammar (no legend on screen; `?` key shows it):
     p  pin / unpin           s   snooze (park): "days [1] or s" then "note"; Esc cancels
     c  close (sweep) all visible 🧹 panes (confirm with y when N > 3)
     x  done                  a   re-activate
-    /  filter rows by substring (Esc clears)     space  toggle detail pane (bottom 7 rows)
+    /  filter by title while typing; ↵ also greps every transcript + rollout → `found` section; Esc clears
+    space  toggle detail pane (bottom 7 rows)
     D  show done sessions    m   whole history    q  quit     ?  help overlay
 Detail pane (when open): title · state · age/wake; note, or `fork of <title>` / subagents N · sid · cwd;
 `you  <last prompt, 2 lines>`; `claude <last assistant text, 2 lines>`.

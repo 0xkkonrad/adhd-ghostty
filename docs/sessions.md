@@ -39,6 +39,32 @@ Titles (uncapped in the model, cut with … at render): /rename > tab-status tit
 compaction-summary heading > first prompt (48 chars). Footer shows `snapshot stale` when the placement file
 is from another boot or older than 60 s; sweeping is then refused.
 
+## Search
+`/welecja` then `↵`: the tree, 📌 and history narrow by title while you type; `↵` then greps every
+Claude transcript and codex rollout on disk (all-time, ~1 s) and lists the sessions not already on screen
+in a `found` section, newest first, with the matching passage from your prompt (else the answer) under
+each row whose title does not contain the term. Matches that occur only in tool output, memory or system
+reminders do not count. Every key works on found rows: `↵` resumes, `p` pins (the row then shows `📌`).
+
+```
+══ found 3 ═════════════════════════════════════════════
+    🚧 Session Dashboard Design Ideas                 0m
+      › …Dashboard now WIN 2 🟢 Welecja Drive Migration…
+       open the welecja ngo stuff. today is the day…  4d
+       Git sync                                      19d
+      › …`keepclub-pages`, `welecja.github.io`, `clear6…
+════════════════════════════════════════════════════════
+
+══ keys ════════════════════════════════════════════════
+ ↵ open       r resume     p pin        s snooze
+ x done       a active     Esc clear    ␣ detail
+ D show done  m more       ? help       q quit
+ /welecja                                       c 🧹 0 ?
+```
+
+`sessions tui --once --search TERM` prints the same frame (tests). Rows found this way are pulled into the model
+whatever their age, so `p`/`s`/`x`/`a` write the ledger for them like any other row.
+
 ## Shortcuts
 
 Sidebar keys (cursor moves over session rows only):
@@ -53,7 +79,7 @@ Sidebar keys (cursor moves over session rows only):
 | `c` | close = sweep every visible 🧹 pane (confirms above 3) |
 | `x` | done (hidden; `D` shows) |
 | `a` | re-activate |
-| `/` … `↵`, `Esc` | filter rows by text / clear the filter |
+| `/` … `↵`, `Esc` | type: rows narrow by title as you type; `↵` also searches every transcript and codex rollout on disk → `══ found N ══` section; `Esc` clears both |
 | `space` | detail pane (7 rows; off when the terminal is under 15 rows) |
 | `D` | show done sessions |
 | `m` | whole history (cap 40 otherwise) |
@@ -152,7 +178,7 @@ Uninstall: `cp ~/.claude/hooks/tab-status.py.bak-20261019 ~/.claude/hooks/tab-st
 `cp ~/.local/bin/ghostty-session.bak-20261019 ~/.local/bin/ghostty-session`; `rm -r ~/.claude/skills/park
 ~/.claude/skills/done ~/.local/state/sessions ~/.cache/sessions ~/.local/bin/sessions`.
 Reset intent only: delete `~/.local/state/sessions/events.jsonl` (and `lineage.json`).
-Tests: `python3 -I tests/run_tests.py` (from the repo ~/workspace/adhd-ghostty) — 102 checks, fixtures in a temp dir, real throwaway
+Tests: `python3 -I tests/run_tests.py` (from the repo ~/workspace/adhd-ghostty) — 115 checks, fixtures in a temp dir, real throwaway
 process trees for the sweep checks (including the kill-time snapshot re-check), a pty for keys/SIGWINCH/SIGTERM.
 
 ## Deviations from the spec mockup (also listed at the top of run_tests.py)

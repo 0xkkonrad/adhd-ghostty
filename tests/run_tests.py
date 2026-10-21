@@ -567,6 +567,45 @@ try:
     rc, out, err = run("tui", "--once", state=st8, gs=gs8, extra=cx8)
     check("detail pane source: codex rows render after touch", rc == 0 and " ├1 🔴 Audit content SEO trust issues" in out, out)
 
+    # 9. search: / then ↵ = title filter + grep over every transcript/rollout → `found` section
+    def raw_transcript(sid, lines, age):
+        p = PROJ / f"{sid}.jsonl"
+        p.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+        os.utime(p, (NOW - age, NOW - age))
+    raw_transcript(SIDS["x"], [
+        {"parentUuid": None, "type": "user", "cwd": CWD, "sessionId": SIDS["x"], "timestamp": "2026-10-08T09:00:00.000Z",
+         "message": {"role": "user", "content": "quarterly numbers review"}},
+        {"type": "assistant", "sessionId": SIDS["x"], "message": {"role": "assistant", "content": [{"type": "text", "text": "brown assistant text first"}]}},
+        {"type": "user", "cwd": CWD, "sessionId": SIDS["x"], "message": {"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>brown reminder noise</system-reminder>"},
+            {"type": "text", "text": "please look at the brown fox report before the call"}]}},
+        {"type": "last-prompt", "lastPrompt": "please look at the brown fox report before the call", "sessionId": SIDS["x"]}], 10 * DAY)
+    raw_transcript(SIDS["y"], [
+        {"parentUuid": None, "type": "user", "cwd": CWD, "sessionId": SIDS["y"], "timestamp": "2026-10-08T09:00:00.000Z",
+         "message": {"role": "user", "content": "unrelated title"}},
+        {"type": "user", "sessionId": SIDS["y"], "message": {"role": "user", "content": [{"type": "tool_result", "content": "brown only in tool output"}]}},
+        {"type": "user", "isMeta": True, "sessionId": SIDS["y"], "message": {"role": "user", "content": "<system-reminder>brown memory index</system-reminder>"}}], 9 * DAY)
+    rc, out, err = run("tui", "--once", "--search", "brown")
+    found9 = out.split("══ found")[1] if "══ found" in out else ""
+    check("search: `found 1` section after the history, old session (10d, beyond decay) listed with its age", rc == 0 and found9.startswith(" 1 ═") and re.search(r"^       quarterly numbers review\s+10d$", found9, re.M), out)
+    check("search: snippet from the user turn (beats the assistant turn), reminder block stripped", re.search(r"^      › .*brown fox report", found9, re.M) and "reminder noise" not in out and "assistant text" not in out, found9)
+    check("search: matches only in tool output / injected context do not count", "unrelated title" not in out, out)
+    check("search: tree + history narrowed by title, windows without a match vanish, footer shows the term + count, keys say Esc clear",
+          "LP Refresh" not in out and "══ window" not in out and "Welecja member" not in out and " /brown" in out and "c 🧹 0 ?" in out and "Esc clear" in out and "/ filter" not in out, out)
+    rc, out, err = run("tui", "--once", "--search", "Welecja")
+    check("search: hits already on screen (tree / history title matches) are not repeated in found", "══ found 0 " in out and "Welecja Drive Migration" in out and "Welecja member explainer" in out, out)
+    rc, out, err = run("tui", "--once", "--search", "welecja", "--width", "40")
+    check("search: --width 40 renders (no keys block), found section present", rc == 0 and "══ found" in out and "══ keys" not in out and all(smod.width(l) <= 40 for l in out.split("\n")), out)
+    rc, out, err = run("tui", "--once", "--search", "footer", state=st8, gs=gs8, extra=cx8)
+    found9 = out.split("══ found")[1] if "══ found" in out else ""
+    check("search: open codex pane whose title misses the term → found row with its live 🔴 + the user-turn snippet", re.search(r"^    🔴 Audit content SEO trust issues\s+\d+[mhd]$", found9, re.M) and re.search(r"^      › and the footer\?$", found9, re.M), out)
+    rc, out, err = run("tui", "--once", "--search", "subagent work", state=st8, gs=gs8, extra=cx8)
+    check("search: codex subagent threads never appear", "══ found 0 " in out and "subagent" not in out.split("══ found")[1].split("══ keys")[0].lower(), out)
+    smod.CLAUDE_DIR, smod.CODEX_DIR = ROOT / "claude", cx_root
+    hits9 = smod.deep_search("bill-splitting")
+    check("deep_search: codex thread whose index name matches (no text hit) is a hit without a snippet", [h["sid"] for h in hits9] == [CC] and hits9[0]["snippet"] == "", str(hits9))
+    check("deep_search: empty term → nothing", smod.deep_search("  ") == [])
+
     # 7. keys through a pty
     def spawn_tui(state, rows=40, cols=56):
         pid, fdm = pty.fork()
@@ -634,11 +673,19 @@ try:
     send(fdm, b"/"); send(fdm, b"Startup"); scr = strip_ansi(send(fdm, b"\r", 0.6))
     lines = [l for l in scr.split("\n") if l.strip()]
     check("pty: filter keeps the tab anchor + matching split, count 2 (anchor is stale)", "├3 ⚪ Shotgun split tree review" in scr and "Startup Valuation" in scr
-          and "LP Refresh" not in scr and " c 🧹 2" in scr, scr)
+          and "LP Refresh" not in scr and "c 🧹 2 ?" in scr and " /Startup" in scr and "══ found 0" in scr and "Esc clear" in scr, scr)
     scr = strip_ansi(send(fdm, b"c", 0.8))
     check("pty: c on filtered rows closes the same 2 (identity fails on fake pids → 0 of 2)", "of 2" in scr, scr[-200:])
     scr = strip_ansi(send(fdm, b"\x1b", 0.6))
     check("pty: Esc clears filter", "LP Refresh" in scr, scr[-400:])
+    send(fdm, b"/"); send(fdm, b"brown"); scr = strip_ansi(send(fdm, b"\r", 1.0))
+    check("pty: / brown ↵ → found section with the old session, cursor on it (only selectable row)", "══ found 1" in scr and "▶      quarterly numbers review" in scr.split("══ found")[-1], scr)
+    scr = strip_ansi(send(fdm, b"p", 0.8))
+    lp = ledger3()[-1]
+    check("pty: p on a found row pins it (stays in found while the title misses the term, 📌 before the age)", lp["sid"] == SIDS["x"] and lp["state"] == "pinned" and re.search(r"▶      quarterly numbers review\s+📌 10d", scr), scr)
+    scr = strip_ansi(send(fdm, b"\x1b", 0.6))
+    check("pty: Esc clears the search too; the pinned hit now sits in the 📌 section", "══ found" not in scr and "LP Refresh" in scr and "/ filter" in scr and re.search(r"📌[▶ ]   quarterly numbers review\s+10d", scr), scr[-900:])
+    send(fdm, b"k" * 30)                              # cursor back to the top (the pinned row sits lower)
     scr = strip_ansi(send(fdm, b"D", 0.6))
     check("pty: D shows done rows", "a finished thing" in scr, scr)
     scr = strip_ansi(send(fdm, b"D", 0.6))

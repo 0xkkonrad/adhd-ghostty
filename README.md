@@ -53,6 +53,28 @@ unit of account:
 - `══ keys ══`: the cheatsheet, always at the bottom, keys in bold yellow (hidden under 20 rows or
   53 columns); `?` shows the legend.
 
+Search (`/welecja` then `↵`): the tree, 📌 and history narrow by title while you type; `↵` then greps every
+Claude transcript and codex rollout on disk (all-time, ~1 s) and lists the sessions not already on screen
+in a `found` section, newest first, with the matching passage from your prompt (else the answer) under
+each row whose title does not contain the term. Matches that occur only in tool output, memory or system
+reminders do not count. Every key works on found rows: `↵` resumes, `p` pins (the row then shows `📌`).
+
+```
+══ found 3 ═════════════════════════════════════════════
+    🚧 Session Dashboard Design Ideas                 0m
+      › …Dashboard now WIN 2 🟢 Welecja Drive Migration…
+       open the welecja ngo stuff. today is the day…  4d
+       Git sync                                      19d
+      › …`keepclub-pages`, `welecja.github.io`, `clear6…
+════════════════════════════════════════════════════════
+
+══ keys ════════════════════════════════════════════════
+ ↵ open       r resume     p pin        s snooze
+ x done       a active     Esc clear    ␣ detail
+ D show done  m more       ? help       q quit
+ /welecja                                       c 🧹 0 ?
+```
+
 ## Shortcuts
 
 Sidebar keys (cursor moves over session rows only):
@@ -67,7 +89,7 @@ Sidebar keys (cursor moves over session rows only):
 | `c` | close = sweep every visible 🧹 pane (confirms above 3) |
 | `x` | done (hidden; `D` shows) |
 | `a` | re-activate |
-| `/` … `↵`, `Esc` | filter rows by text / clear the filter |
+| `/` … `↵`, `Esc` | type: rows narrow by title as you type; `↵` also searches every transcript and codex rollout on disk → `══ found N ══` section; `Esc` clears both |
 | `space` | detail pane (7 rows; off when the terminal is under 15 rows) |
 | `D` | show done sessions |
 | `m` | whole history (cap 40 otherwise) |
@@ -97,7 +119,7 @@ and resuming it; only `p`, `/pin`, `x` or `/done` change that.
 | `hooks/tab-status.py` | Claude Code hook: status icon + short title in the tab, `.state` files the sidebar reads |
 | `skills/` | `/park`, `/pin`, `/done`, `/fork-here` for Claude Code |
 | `shell/bashrc-snippet.sh` | the `~/.bashrc` block that lets a fresh split pick up its command |
-| `tests/run_tests.py` | 102 checks: render, ledger, sweep with real processes, pty keys, install idempotency |
+| `tests/run_tests.py` | 115 checks: render, ledger, search, sweep with real processes, pty keys, install idempotency |
 | `docs/` | `sessions.md` (operate, reset, limits), `sessions-spec.md` (the agreed design), ghostty-session and tab-status notes |
 
 ## Install
