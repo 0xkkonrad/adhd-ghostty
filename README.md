@@ -105,6 +105,22 @@ In a Claude Code session:
 | `/done` | mark done |
 | `/fork-here [down]` | fork this session into a new split |
 
+In a Codex session, `$fork-here [down]` does the same.
+
+## Fork a session
+
+`/fork-here` (Claude) or `$fork-here` (Codex) opens a split next to the current pane, in the same Ghostty
+window, running a copy of this session: `claude -r <id> --fork-session` or `codex fork <id>`. The original
+keeps going. Both share the history up to the fork, then diverge. The sidebar draws the copy as `└⑂` under
+its parent while both sit in one tab; the detail pane names the parent.
+
+- Default is a split to the right; `down` stacks it below.
+- The window is the one whose title is this tab's title, else the focused one. It refuses rather than guess;
+  switch to the tab and run it again, or force one with `GHOSTTY_SPLIT_WINDOW=<n>` (`ghostty-window-of --list`).
+- The new split runs its command through the `~/.bashrc` pickup block (`shell/bashrc-snippet.sh`).
+- `codex-fork-split` keeps this pane's `codex` binary and `PATH`, so a split that loads another Node version
+  still starts the same codex.
+
 Typing in a parked session re-activates it. A pinned session stays pinned through typing, closing its tab
 and resuming it; only `p`, `/pin`, `x` or `/done` change that.
 
@@ -118,6 +134,7 @@ and resuming it; only `p`, `/pin`, `x` or `/done` change that.
 | `bin/claude-fork-split`, `bin/codex-fork-split` | `/fork-here`: fork the current session into a new split |
 | `hooks/tab-status.py` | Claude Code hook: status icon + short title in the tab, `.state` files the sidebar reads |
 | `skills/` | `/park`, `/pin`, `/done`, `/fork-here` for Claude Code |
+| `codex-skills/` | `$fork-here` for Codex |
 | `shell/bashrc-snippet.sh` | the `~/.bashrc` block that lets a fresh split pick up its command |
 | `tests/run_tests.py` | 115 checks: render, ledger, search, sweep with real processes, pty keys, install idempotency |
 | `docs/` | `sessions.md` (operate, reset, limits), `sessions-spec.md` (the agreed design), ghostty-session and tab-status notes |
@@ -125,7 +142,7 @@ and resuming it; only `p`, `/pin`, `x` or `/done` change that.
 ## Install
 
 ```
-./install.sh            # copies bin/ hooks/ skills/ into place with dated backups, prints what is left to do
+./install.sh            # copies bin/ hooks/ skills/ codex-skills/ into place with dated backups, prints what is left to do
 sessions install        # wires the hook line, skills and ghostty-session integration (idempotent)
 ghostty-session install # systemd user timer + login restore + Super+Shift+T (once)
 ```

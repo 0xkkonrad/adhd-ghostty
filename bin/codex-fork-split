@@ -3,4 +3,9 @@
 # Usage: codex-fork-split [session-id] [right|down]  (default: $CODEX_THREAD_ID, right)
 set -euo pipefail
 sid=${1:-${CODEX_THREAD_ID:-${CODEX_SESSION_ID:?no session id given and CODEX_THREAD_ID unset}}}
-exec ghostty-split-run "${2:-right}" --focused -- bash -c "cd $(printf %q "$PWD") && codex fork $sid"
+# A new split can select a different Node version, or fail to load NVM at all.
+# Preserve this session's executable and PATH (the npm launcher needs node too).
+codex_bin=$(type -P codex) || { echo "codex-fork-split: codex is not available in this shell" >&2; exit 127; }
+"$codex_bin" --version >/dev/null
+exec ghostty-split-run "${2:-right}" --focused -- /usr/bin/env "PATH=$PATH" /bin/bash -c \
+  'cd -- "$1" && exec "$2" fork "$3"' codex-fork-split "$PWD" "$codex_bin" "$sid"

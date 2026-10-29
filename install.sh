@@ -3,6 +3,7 @@
 #   bin/*            → ~/.local/bin/
 #   hooks/*.py       → ~/.claude/hooks/
 #   skills/<name>/   → ~/.claude/skills/<name>/
+#   codex-skills/<name>/ → ~/.codex/skills/<name>/
 # Then run `sessions install` (hook line, skills, ghostty-session integration) and, once,
 # `ghostty-session install` (systemd timer + login restore). See README.md.
 set -euo pipefail
@@ -23,6 +24,10 @@ for f in "$here"/hooks/*.py; do put "$f" "$HOME/.claude/hooks/$(basename "$f")" 
 for d in "$here"/skills/*/; do
   name=$(basename "$d")
   for f in "$d"*; do put "$f" "$HOME/.claude/skills/$name/$(basename "$f")"; done
+done
+for d in "$here"/codex-skills/*/; do
+  name=$(basename "$d")
+  for f in "$d"*; do put "$f" "$HOME/.codex/skills/$name/$(basename "$f")"; done
 done
 
 [[ $changed == 1 ]] || echo "everything already in place"
