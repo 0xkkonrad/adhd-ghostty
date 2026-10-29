@@ -25,3 +25,6 @@ and run /fork-here again. `GHOSTTY_SPLIT_WINDOW=<n>` forces a window; list
 them with `ghostty-window-of --list`.
 Tooling: `~/.local/bin/ghostty-window-of`, `~/.local/bin/ghostty-split-run`,
 `~/.local/bin/claude-fork-split`, pickup hook at the end of `~/.bashrc`.
+
+If the command is not found, the tools are not installed: run `./install.sh` from
+https://github.com/0xkkonrad/adhd-ghostty and add `shell/bashrc-snippet.sh` to `~/.bashrc`.

@@ -19,3 +19,6 @@ permissions), no Ghostty window on D-Bus, or the split opened in the wrong windo
 `gdbus introspect --session -d com.mitchellh.ghostty -o /com/mitchellh/ghostty/window`).
 Tooling: `~/.local/bin/ghostty-split-run`, `~/.local/bin/codex-fork-split`,
 pickup hook at the end of `~/.bashrc`.
+
+If the command is not found, the tools are not installed: run `./install.sh` from
+https://github.com/0xkkonrad/adhd-ghostty and add `shell/bashrc-snippet.sh` to `~/.bashrc`.
