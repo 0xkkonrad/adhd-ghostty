@@ -453,9 +453,11 @@ try:
 
     cx_root = ROOT / "codex8"; cx_root.mkdir()          # own dir: the shared fixtures must not gain codex rows
     cx8 = {"SESSIONS_CODEX_DIR": str(cx_root)}
-    def rollout(tid, started, cwd=CWD, source="user", first="", last_prompt="", last_assistant="", mtime=None, day="2026/10/19"):
-        d = cx_root / "sessions" / day; d.mkdir(parents=True, exist_ok=True)
-        meta = {"id": tid, "cwd": cwd, "thread_source": source, "timestamp": "2026-10-19T21:54:37.758Z"}
+    def rollout(tid, started, cwd=CWD, source="user", first="", last_prompt="", last_assistant="", mtime=None):
+        created = datetime.fromtimestamp(started).astimezone()
+        # History scans recent date folders, so their dates must follow the fixture clock too.
+        d = cx_root / "sessions" / created.strftime("%Y/%m/%d"); d.mkdir(parents=True, exist_ok=True)
+        meta = {"id": tid, "cwd": cwd, "thread_source": source, "timestamp": created.isoformat()}
         if source == "subagent":
             meta["source"] = {"subagent": {"thread_spawn": {"parent_thread_id": SIDS["a"]}}}
             meta["parent_thread_id"] = SIDS["a"]
@@ -467,7 +469,7 @@ try:
                  json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": last_prompt}]}}),
                  json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": last_assistant}}),
                  json.dumps({"type": "event_msg", "payload": {"type": "token_count"}})]
-        f = d / f"rollout-2026-10-19T21-54-37-{tid}.jsonl"
+        f = d / f"rollout-{created:%Y-%m-%dT%H-%M-%S}-{tid}.jsonl"
         f.write_text("\n".join(lines) + "\n")
         os.utime(f, (mtime or started, mtime or started))
         return f
@@ -477,7 +479,7 @@ try:
     rollout(CA, T0 + 3, first="audit the content for seo trust issues please", last_prompt="and the footer?", last_assistant="Footer fixed, three links added.", mtime=NOW - 600)
     rollout(CB, T0 + 102, first="propose peanut growth plans", mtime=NOW - 3000)
     rollout(CC, T0 + 200, first="old closed thread", mtime=NOW - 3600)
-    rollout(CD, T0 - 5 * DAY, first="ancient thread", mtime=NOW - 5 * DAY, day="2026/10/14")
+    rollout(CD, T0 - 5 * DAY, first="ancient thread", mtime=NOW - 5 * DAY)
     rollout(CE, T0 + 300, source="subagent", first="subagent work", mtime=NOW - 100)
     rollout(CF, T0 + 400, first="never named, closed", mtime=NOW - 200)
     (cx_root / "session_index.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
