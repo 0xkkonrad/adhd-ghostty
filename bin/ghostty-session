@@ -476,6 +476,30 @@ def uptime_s():
         return 1e9
 
 
+def session_age_s():
+    """Seconds since this user session (systemd --user basic.target) came up — NOT since boot: a long
+    wait at the login screen (4 Nov 2026: 29 min) must not expire the pre-boot snapshot hold."""
+    try:
+        out = subprocess.run(["systemctl", "--user", "show", "-p", "ActiveEnterTimestampMonotonic", "basic.target"],
+                             capture_output=True, text=True, timeout=5).stdout
+        us = int(out.strip().split("=", 1)[1])
+        if us > 0:
+            return max(0.0, time.monotonic() - us / 1e6)
+    except Exception:
+        pass
+    return uptime_s()
+
+
+def login_restore_done():
+    """True once ghostty-session-restore.service finished in this user session."""
+    try:
+        out = subprocess.run(["systemctl", "--user", "show", "-p", "ExecMainExitTimestampMonotonic",
+                              "ghostty-session-restore.service"], capture_output=True, text=True, timeout=5).stdout
+        return int(out.strip().split("=", 1)[1]) > 0
+    except Exception:
+        return True
+
+
 def load_json(p, default):
     try:
         return json.loads(Path(p).read_text())
@@ -839,9 +863,11 @@ def save():
         # nothing open: keep the last populated snapshot — the login restore and cold-start reopen it
         return prev
     if (prev.get("windows") and prev.get("boot_id") != boot_id()
-            and prev.get("restored_boot") != boot_id() and uptime_s() < 900):
+            and prev.get("restored_boot") != boot_id()
+            and (session_age_s() < 900 or not login_restore_done())):
         # fresh boot and the pre-boot snapshot has not been consumed by on-login yet: never let the
-        # first post-boot ticks (one empty window) overwrite it (19 Oct 2026: a crash restore reopened 1 shell)
+        # first post-boot ticks (one empty window) overwrite it (19 Oct 2026: a crash restore reopened 1 shell;
+        # 4 Nov 2026: same again because the hold was measured from boot and login came 29 min later)
         return prev
     write_json(CUR, snap)
     HIST.mkdir(parents=True, exist_ok=True)
