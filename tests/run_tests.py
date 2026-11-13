@@ -709,6 +709,25 @@ try:
     check("pty: q leaves alternate screen + resets title", "\x1b[?1049l" in scr and "\x1b]2;\x07" in scr, repr(scr[-100:]))
     os.waitpid(pid, 0)
 
+    # ↵ on rows that have no place of their own (📌 section, found) while the session is open
+    st10 = ROOT / "state10"; shutil.copytree(ST, st10)
+    rc, out, _ = run("focus", SIDS["g"], state=st10)
+    check("focus SID: hint from the session's placement", rc == 0 and out.strip().endswith("· alt+5"), out)
+    pid, fdm = spawn_tui(st10)
+    time.sleep(1.2); scr = strip_ansi(send(fdm, b"", 0.1))
+    for _ in range(40):
+        if "📌▶" in scr:
+            break
+        scr = strip_ansi(send(fdm, b"j", 0.15))
+    scr2 = strip_ansi(send(fdm, b"\r", 0.6))
+    check("pty: ↵ on an open 📌 row → hint for its tab, sidebar alive", "📌▶" in scr and "Lisbon Sailing" in scr and "alt+5" in scr2 and os.waitpid(pid, os.WNOHANG) == (0, 0), scr2[-400:])
+    time.sleep(4.2)
+    send(fdm, b"/"); send(fdm, b"wrapping"); scr = strip_ansi(send(fdm, b"\r", 1.0))
+    scr2 = strip_ansi(send(fdm, b"\r", 0.6))
+    check("pty: ↵ on an open found row → hint, sidebar alive", "══ found" in scr and "══ found 0" not in scr and re.search(r"alt\+\d", scr2) and os.waitpid(pid, os.WNOHANG) == (0, 0), scr2[-400:])
+    send(fdm, b"q"); send(fdm, b"q", 0.6)
+    os.waitpid(pid, 0)
+
     pid, fdm = spawn_tui(st3)
     time.sleep(1.2); send(fdm, b"", 0.1)
     os.kill(pid, signal.SIGTERM)

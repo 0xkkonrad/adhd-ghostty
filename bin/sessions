@@ -784,7 +784,7 @@ def build_model(now=None, extra=None):
 
     for wi, w in enumerate(snap.get("windows") or [], 1):
         win = {"n": wi, "title": ICON_RE.sub("", str(w.get("title") or "")).strip() or f"window {wi}",
-               "focused": bool(w.get("focused")), "tabs": []}
+               "focused": bool(w.get("focused")), "ntabs": len(w.get("tabs") or []), "tabs": []}
         for ti, t in enumerate(w.get("tabs") or [], 1):
             tab = {"n": ti, "active": bool(t.get("active")), "surfaces": []}
             for s in sorted(t.get("surfaces") or [], key=lambda s: s.get("seq", 0)):
@@ -1175,8 +1175,15 @@ def new_tab_with(cmd):
     tmp = PENDING_DIR / "pending.tmp"
     tmp.write_text(cmd)
     os.replace(tmp, PENDING_DIR / "pending")
-    subprocess.run(["gdbus", "call", "--session", "-d", BUS, "-o", f"{OBJ}/window/{win}", "-m",
-                    "org.gtk.Actions.Activate", "new-tab", "[]", "{}"], capture_output=True, timeout=20)
+    try:
+        subprocess.run(["gdbus", "call", "--session", "-d", BUS, "-o", f"{OBJ}/window/{win}", "-m",
+                        "org.gtk.Actions.Activate", "new-tab", "[]", "{}"], capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            (PENDING_DIR / "pending").unlink()
+        except OSError:
+            pass
+        return False, "gdbus failed"
     for _ in range(24):
         if not (PENDING_DIR / "pending").exists():
             return True, f"new tab in window {win}"
@@ -1205,15 +1212,30 @@ def do_resume(rec):
     return ok, msg
 
 
-def focus_hint(row):
-    n, title = row["tab"], row.get("win_title") or f"window {row['win']}"
+def focus_hint(rec, model, at=None):
+    """Where an open session sits: `at` (win, tab) of the row pressed, else its first placement
+    (pinned and found rows have no place of their own)."""
+    w, n = at or rec["placements"][0][:2]
+    win = model["windows"][w - 1]
     if n <= 8:
         key = f"alt+{n}"
-    elif n == 9 and row.get("last_tab"):
-        key = "alt+9 = last tab"
+    elif n == win["ntabs"]:
+        key = f"alt+9 = last tab ({n})" if n > 9 else "alt+9 = last tab"
     else:
         key = f"tab {n}"
-    return f'→ "{title}" · {key}'
+    more = len({p[:2] for p in rec["placements"]}) - 1
+    return f'→ "{win["title"]}" · {key}' + (f" (+{more} more)" if more > 0 else "")
+
+
+def log_crash():
+    """Keep the traceback of a key handler that raised (the footer only has room for one line)."""
+    try:
+        import traceback
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(STATE / "tui-errors.log", "a") as f:
+            f.write(f"--- {datetime.now().isoformat(timespec='seconds')}\n{traceback.format_exc()}\n")
+    except OSError:
+        pass
 
 
 def check_target(surf):
@@ -1552,7 +1574,7 @@ def tui(width_opt=None):
                 rebuild()
             elif ch in ("\r", "\n", "r"):
                 if rec and rec["open"]:
-                    say(focus_hint(cur), 4)
+                    say(focus_hint(rec, model, (cur["win"], cur["tab"]) if cur.get("surf") else None), 4)
                 elif rec:
                     say("resuming…", 8)
                     draw()
@@ -1616,7 +1638,14 @@ def tui(width_opt=None):
                     keys.append(data[i]); i += 1
             stop = False
             for key in keys:
-                if handle(key) is False:
+                try:
+                    res = handle(key)
+                except Exception as e:                # one bad key must not take the sidebar down
+                    log_crash()
+                    state["mode"], state["buf"] = None, ""
+                    say(f"✗ {type(e).__name__}: {e} (tui-errors.log)", 6)
+                    break                             # drop the rest of this read
+                if res is False:
                     stop = True
                     break
             if stop:
@@ -1692,10 +1721,7 @@ def cmd_focus(sid):
     if not rec or not rec["open"]:
         print("not open", file=sys.stderr)
         return 1
-    w, t, _ = rec["placements"][0]
-    win = model["windows"][w - 1]
-    row = {"tab": t, "win": w, "win_title": win["title"], "last_tab": t == len(win["tabs"])}
-    print(focus_hint(row))
+    print(focus_hint(rec, model))
     return 0
 
 
